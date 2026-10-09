@@ -16,7 +16,7 @@ Everything you do in the demo lives only in your browser. Refresh the page and i
 
 - **Pluggable connectors.** A connector is a self-contained module with a small `execute` contract. Adding a connector type is a code change plus a rebuild; registering unlimited partner instances of an existing type is a pure UI action, with no redeploy.
 - **Config-driven, not hardcoded.** Systems, integration types, credentials, endpoints, and schedules live in the database. Outbound credentials are encrypted at rest with AES-256-GCM; inbound API keys are hashed. Everything is managed through the admin console.
-- **One governed inbound gateway.** External partners authenticate with an API key or bearer token and are confined to their own system's routes. A partner cannot reach another partner's endpoints. Everything is rate-limited and logged.
+- **One governed inbound gateway.** External partners authenticate with an API key, bearer token or Basic credentials and are confined to their own system's routes. A partner cannot reach another partner's endpoints. Every request is rate-limited and logged.
 - **Provisioned-dormant by default.** A fresh deploy ships fully built but idle. Systems start in a setup state, no schedules are armed, notifications are off. Nothing runs, and nothing consumes recurring hosting quota, until a project explicitly activates it.
 - **Serverless-native job engine.** Inbound work runs inline. Outbound and scheduled work drains from a Postgres-backed queue with retry, backoff, and a dead-letter queue that supports replay. No Redis, no long-running worker.
 
@@ -24,18 +24,31 @@ Everything you do in the demo lives only in your browser. Refresh the page and i
 
 ```
 partner request
-   -> inbound gateway authenticates the caller (API key / bearer)
+   -> inbound gateway rate-limits by IP, then authenticates the caller (API key / bearer / basic)
       and confirms the URL system code matches the caller (no cross-system access)
-   -> the system must be ACTIVE (a dormant system rejects traffic)
+   -> the per-system rate limit is applied; the system must be ACTIVE (a dormant system rejects traffic)
    -> the bound connector validates the payload against its schema
    -> the connector runs; a job row records the outcome
-   -> everything is logged; outbound/scheduled work drains from a queue with retry + DLQ
+   -> every outcome (including rejections) is logged; outbound/scheduled work drains from a queue with retry + DLQ
 ```
+
+## What exists today, and what is planned
+
+Built and working in the real application:
+
+- Inbound gateway with API key, bearer and Basic authentication (all three are verified today; screens to issue bearer and Basic credentials are planned for P2), per-system confinement, per-IP and per-system rate limiting (`X-RateLimit-*`, `Retry-After`, fail-open), request ids, idempotent retries, and an activity log row for every outcome.
+- Encrypted credential vault, connector manifest, Postgres-backed job queue with retry, backoff, a dead-letter queue, stuck-job reclaim, and cron schedules fired exactly once by one signed QStash tick (dormant until an operator arms it).
+- Admin console with working sign-in, permission-based access control (checked against the database on every page and action, 8 hour sessions, throttled sign-in), and server-rendered pages for systems, connectors, jobs, schedules and audit.
+- CI on every push: typecheck, lint, tests (against an in-memory Postgres) and build.
+
+Wired in the next phase (P1b): DLQ replay and manual run from the console (`replayDlq()` exists and is tested; the `jobs:run` and `jobs:retry` permission checks come with it).
+
+Planned, not built yet: a typed `/api/admin/*` HTTP API, user and role management screens, per-endpoint rate limits, a rate-limit monitor, DLQ discard and notes screens, log and activity viewers, alerting, an API playground and generated OpenAPI docs.
 
 ## Architecture and security
 
 - [Architecture](docs/architecture.md): system design, the connector model, the job engine, the dormant posture.
-- [Security](docs/security.md): the credential vault, inbound authentication and cross-system confinement, role-based access control, and the threat model.
+- [Security](docs/security.md): the credential vault, inbound authentication and cross-system confinement, rate limiting, permission-based access control, and the threat model.
 
 ## Stack
 
