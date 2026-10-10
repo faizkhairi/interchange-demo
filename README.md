@@ -38,12 +38,12 @@ Built and working in the real application:
 
 - Inbound gateway with API key, bearer and Basic authentication (all three are verified today; screens to issue bearer and Basic credentials are planned for P2), per-system confinement, per-IP and per-system rate limiting (`X-RateLimit-*`, `Retry-After`, fail-open), request ids, idempotent retries, and an activity log row for every outcome.
 - Encrypted credential vault, connector manifest, Postgres-backed job queue with retry, backoff, a dead-letter queue, stuck-job reclaim, and cron schedules fired exactly once by one signed QStash tick (dormant until an operator arms it).
-- Admin console with working sign-in, permission-based access control (checked against the database on every page and action, 8 hour sessions, throttled sign-in), and server-rendered pages for systems, connectors, jobs, schedules and audit.
+- Admin console with working sign-in, permission-based access control (checked against the database on every request, 8 hour sessions, throttled sign-in), and pages for systems, connectors, jobs, schedules and audit.
+- A typed admin API: one `AdminApi` contract, implemented over HTTP (`/api/admin/*`, one catch-all route driven by an endpoint registry, every request through `withAdmin`) and in the browser for the demo, behind a single client UI. One contract test suite runs against both implementations.
+- Manual job run and DLQ replay from the console, gated by the `jobs:run` and `jobs:retry` permissions.
 - CI on every push: typecheck, lint, tests (against an in-memory Postgres) and build.
 
-Wired in the next phase (P1b): DLQ replay and manual run from the console (`replayDlq()` exists and is tested; the `jobs:run` and `jobs:retry` permission checks come with it).
-
-Planned, not built yet: a typed `/api/admin/*` HTTP API, user and role management screens, per-endpoint rate limits, a rate-limit monitor, DLQ discard and notes screens, log and activity viewers, alerting, an API playground and generated OpenAPI docs.
+Planned, not built yet: user and role management screens, per-endpoint rate limits, a rate-limit monitor, DLQ discard and notes screens, log and activity viewers, alerting, an API playground and generated OpenAPI docs.
 
 ## Architecture and security
 

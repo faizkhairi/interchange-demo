@@ -140,12 +140,12 @@ Key mechanics:
 - **The queue is not a separate table.** It is `job` rows with `status IN ('PENDING', 'RETRY')` whose `next_attempt_at` is due. This is a deliberate simplification: one source of truth for both "what ran" and "what's next".
 - **Claiming is race-safe without Redis.** `FOR UPDATE SKIP LOCKED` inside a transaction lets multiple concurrent invocations of the drain (which can happen on serverless, since nothing guarantees single-flight) each claim a disjoint batch.
 - **Backoff is exponential**, based on the attempt count: `BACKOFF_BASE_MS * 2^(attempts - 1)`.
-- **The DLQ (`job_dlq`) is a queryable ledger of terminal failures**, each pointing back at the original `job.id`, with the reason (`retries exhausted` or `non-retryable failure`) and the last error payload. `replayDlq(jobId)` resets a DLQ'd job to `PENDING` with `attempts` cleared, so it re-enters the drain on the next pass. The function exists and is tested; the admin action and the `jobs:run` / `jobs:retry` permission checks that will call it are wired in P1b.
+- **The DLQ (`job_dlq`) is a queryable ledger of terminal failures**, each pointing back at the original `job.id`, with the reason (`retries exhausted` or `non-retryable failure`) and the last error payload. `replayDlq(jobId)` resets a DLQ'd job to `PENDING` with `attempts` cleared, so it re-enters the drain on the next pass. The console calls it through `POST /api/admin/dlq/:jobId/replay`, which requires `jobs:retry` (a job that is no longer replayable returns `CONFLICT`). A manual run is `POST /api/admin/jobs`, which requires `jobs:run`.
 - **Schedules (`job_schedule`) fire by cron, exactly once.** Each enabled schedule has a `next_run_at`. A tick claims a due schedule with a compare-and-swap (`UPDATE ... WHERE id = ? AND next_run_at = ? RETURNING`), so two overlapping ticks cannot both fire it, then enqueues one PENDING outbound job and computes the next `next_run_at` from the cron expression (croner, UTC). The claim and the job insert share one transaction, so a failed insert rolls the claim back and the next tick retries the same slot. A schedule registers nothing with QStash: its cadence is its own cron, evaluated by the tick, so it can run no more often than the tick. `/api/jobs/dispatch` does only this enqueue step, and only for due schedules.
 - **`/api/jobs/tick` is the single background driver.** One signed QStash call per cadence runs, in order: stuck-job reclaim, due-schedule dispatch, a bounded `drainBatch()`, and a prune of expired rate-limit buckets and old `activity_log` rows. Each stage has its own try/catch, so one failure cannot skip the others; if any stage failed the response is 500 with every stage's result. There is exactly one QStash schedule, cadence `QSTASH_TICK_CRON` (default `*/5 * * * *`), created by the explicit "Arm tick" action on the Schedules page (`armTick()`, id stored in `app_setting`) and removed by "Disarm tick". It is dormant until armed.
 - **Stuck jobs are reclaimed.** A job left `PROCESSING` with `locked_at` older than `JOB_STUCK_MINUTES` (default 10) lost its worker. An outbound job returns to `RETRY` with backoff while attempts remain, otherwise goes to the DLQ through the same path as a normal failure; this is at-least-once delivery, so outbound handlers and the partners they call must be idempotent. An inbound job is never re-executed: it goes to `FAILED`, and the partner's retry with the same `Idempotency-Key` receives that recorded failure.
 - **QStash calls are signature-verified.** `/api/jobs/tick`, `/dispatch` and `/process` verify the `Upstash-Signature` header against the raw body with `QSTASH_CURRENT_SIGNING_KEY` / `QSTASH_NEXT_SIGNING_KEY`. The expected url is built from `APP_URL` (else `NEXTAUTH_URL`) plus the request path and passed to the verifier, so a signature minted for one endpoint cannot be replayed against another. With the keys unset they fail closed (503). The only bypass is an explicit `QSTASH_DEV_BYPASS=1`, honoured outside production only.
-- **DLQ review state.** `job_dlq.status` is `PENDING_REVIEW`, `RETRIED` or `DISCARDED`; the dashboard count and the DLQ list share one helper (`core/jobs/dlq.ts`) and filter `PENDING_REVIEW`; the list shows "Showing 50 of N" when capped. `replayDlq()` marks the entry `RETRIED`. There is no admin screen for discard, notes or replay yet (planned).
+- **DLQ review state.** `job_dlq.status` is `PENDING_REVIEW`, `RETRIED` or `DISCARDED`; the dashboard count and the DLQ list share one helper (`core/jobs/dlq.ts`) and filter `PENDING_REVIEW`; the list shows "Showing 50 of N" when capped. `replayDlq()` marks the entry `RETRIED`. The Jobs page has a DLQ view with a replay action; discard and notes screens do not exist yet (planned).
 
 ## The connector plugin model
 
@@ -206,6 +206,17 @@ A fresh deploy is fully built but inert by design:
 
 See `docs/deployment.md` for the exact activation steps, and `docs/security.md` for why this is also a security property, not only a cost-control one.
 
+## Admin API and demo
+
+The admin console is one client UI (`src/features/*`, routed by `src/features/shell/ConsoleShell.tsx` from the table in `src/features/routes.ts`) over a single typed interface, `AdminApi` (`src/admin-api/contract.ts`). The UI never knows which implementation it talks to; that is what lets the live console and the public demo share every screen.
+
+- **`HttpAdminApi`** (`src/admin-api/http/client.ts`) calls `/api/admin/*`. On the server, one catch-all route (`src/app/api/admin/[...path]/route.ts`) matches method and path against the endpoint registry (`src/admin-api/endpoints/`). Each endpoint declares its id, method, path, permission, zod input, output and audit action, so there are no per-endpoint route files. An unknown path is 404 and a known path with the wrong method is 405.
+- **`DemoAdminApi`** (`src/admin-api/demo/`) runs entirely in the browser over an in-memory engine seeded with fictional data. It makes no `/api` calls, enforces the same permissions per role and returns the same error codes, so the demo behaves like the real console. It lives at `/demo`, which links into `/demo/console?as=admin|operator|viewer`; inside the console a "view as" switcher changes role and a reset button restores the seed.
+- **Every `/api/admin` request runs through `withAdmin`** (`core/http/with-admin.ts`): request id, CSRF guard and JSON-only body on non-GET requests, `requirePermission` against the database before input is parsed, a 64 KB body cap, zod validation, then the error envelope `{error:{code,message,requestId,issues?}}`. Responses carry `Cache-Control: no-store`. See `docs/security.md` for the full order and reasoning.
+- **One contract suite, two implementations.** `test/contract/admin-api.contract.ts` defines the behaviour (counts match filtered lists, validation before side effects, viewers refused on every mutation, duplicate codes conflict) and runs against both `HttpAdminApi` (`test/contract/http.test.ts`) and `DemoAdminApi` (`test/contract/demo.test.ts`). A registry test checks that every endpoint has a permission and every mutation has an audit action.
+- **Capability flag.** `AdminApi.capabilities` lets an implementation say what it supports. Notifications exist in the demo only: `DemoAdminApi` reports `notifications: true`, `HttpAdminApi` reports `false` until a later phase adds a notifications table, and the bell and Notifications page render only when the flag is set.
+- **Auth boundary.** The admin layout (`src/app/admin/layout.tsx`) still performs the database-backed `requireActiveUser()` check and redirects to `/login`; the API is the gate on every call.
+
 ## Where to look in the code
 
 | Concern | File |
@@ -231,3 +242,10 @@ See `docs/deployment.md` for the exact activation steps, and `docs/security.md` 
 | Config/auth schema (14 tables) | `db/schema/config-auth.ts` |
 | Opt-in upstream schema | `db/schema/upstream.ts` |
 | DB client | `core/db.ts` |
+| Admin API contract | `src/admin-api/contract.ts` |
+| Admin endpoint registry | `src/admin-api/endpoints/` |
+| Admin catch-all route | `src/app/api/admin/[...path]/route.ts` |
+| Admin request wrapper | `core/http/with-admin.ts` |
+| HTTP and demo implementations | `src/admin-api/http/client.ts`, `src/admin-api/demo/` |
+| Console UI and routes | `src/features/`, `src/features/routes.ts` |
+| Contract suite | `test/contract/admin-api.contract.ts` |
