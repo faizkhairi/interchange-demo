@@ -34,11 +34,14 @@ Partner                     Interchange                              Data
   |                             |    - look up external_system by      |
   |                             |      systemCode from the URL         |
   |                             |    - require status = ACTIVE         |
-  |                             |    - verify against system_api_key,  |
-  |                             |      system_bearer_token or          |
-  |                             |      system_basic_auth (timing safe) |
+  |                             |    - find the credential by lookup   |
+  |                             |      hash (or keyed username         |
+  |                             |      lookup), verify timing safe     |
+  |                             |    - reject revoked or expired       |
   |                             |    - stamp last_used_at on the match |
   |         401                 |  (all pre-auth failures: one body)   |
+  |<-----------------------------                                      |
+  |         403                 |  (confinement: owner in log only)    |
   |<-----------------------------                                      |
   |                             | 1b. per-system rate limit (bucket    |
   |         429 + Retry-After   |    sys:<code>, external_system       |
@@ -70,11 +73,15 @@ Source: `src/app/api/inbound/[systemCode]/[endpoint]/route.ts`, `core/auth/with-
 
 Properties worth calling out:
 
-- **systemCode confinement.** The auth guard resolves the partner system named in the URL first, then checks whether the presented credential belongs to that system. A valid credential for system A can never authenticate a call to system B's routes, even if both are ACTIVE.
+- **systemCode confinement.** The auth guard resolves the partner system named in the URL first, then identifies the presented credential by its lookup index across all systems. A valid credential for system A can never authenticate a call to system B's routes, even if both are ACTIVE: it is refused with a generic `403`, and the owning system is recorded only in the activity row. Revoked and expired credentials get `401`. See `docs/security.md`.
 - **Rate limiting is Postgres-backed and fails open.** Each check is one atomic `INSERT ... ON CONFLICT (key, window_start) DO UPDATE SET count = count + 1 RETURNING count` against `rate_limit_bucket` (one-minute fixed windows). Responses carry `X-RateLimit-Limit`, `X-RateLimit-Remaining` and `X-RateLimit-Reset`; a rejected call gets 429 with `Retry-After`. If the database is unreachable the limiter logs a warning and lets the request through, because a limiter outage must not become a gateway outage. The client IP is taken from `x-vercel-forwarded-for`, then `x-real-ip`, then the first `x-forwarded-for` entry, and must parse as an IP address (anything else shares an `unknown` bucket); on a host that does not overwrite `x-forwarded-for` that last fallback is client-controlled, so put a trusted proxy in front. The per-IP limit (`RATE_LIMIT_IP_RPM`, default 250 per minute) is checked before authentication, which throttles credential guessing; the per-system limit (`external_system.rate_limit_rpm`) is checked after, so strangers cannot burn a partner's quota. Per-endpoint limits and a rate-limit monitor screen are not built yet (planned).
 - **Idempotent retries.** A repeated `Idempotency-Key` from the same system returns the original job's result with `Idempotent-Replayed: true` instead of creating a second job or failing. The same key with a different payload is a 422; a duplicate that arrives while the original is still running is a 409. The key is trimmed (an empty key counts as absent), at most 200 printable ASCII characters (else 400), and stored with an `in:` prefix so a partner key can never collide with a scheduler key. Only true replays carry `Idempotent-Replayed: true`; the 422 does not.
 - **Every outcome is logged.** `activity_log` (`core/gateway/activity.ts`) gets one row per inbound call, including auth failures, rate limits and validation errors. Both payloads are required by the TypeScript type (use `{}` or `{ reason }` when there is no body), secret-looking keys (auth, authorization, bearer, jwt, otp, pin, secret, token, password, apikey, card, cvv, ssn, signature, cookie, session and similar, matched case-insensitively at any depth) are redacted, and credentials or `Authorization` headers are never stored. The row is written after the response is sent (`after()` on the Vercel runtime) so logging adds no latency. `activity_log` rows older than `ACTIVITY_RETENTION_DAYS` (default 30) are pruned by the tick. This is separate from `admin_audit_log`, which records admin actions.
 - **Fail-fast on an unknown handler.** If `integration_type.handler_key` does not exist in the generated manifest, `resolveHandler()` throws `UnresolvedHandlerError` immediately rather than queuing a job that will never succeed.
+
+## Edge proxy
+
+Before any route handler runs, the Next proxy (`src/proxy.ts`, Node runtime; it sits in `src/` because the app directory is `src/app`) handles every request except static assets, icons and prefetches. It resolves the request id (step 0 above), generates the Content-Security-Policy nonce and sets the CSP, adds HSTS over https, and applies the global CORS rule to `/api/*` (deny-all unless `CORS_ALLOWED_ORIGINS` lists the origin, and never for `/api/admin/*`). Because a nonce needs a request, every page renders dynamically. The pure header builders are in `core/http/security-headers.ts`. See `docs/security.md` for the exact policy.
 
 ## Outbound and scheduled job lifecycle
 
@@ -212,7 +219,8 @@ The admin console is one client UI (`src/features/*`, routed by `src/features/sh
 
 - **`HttpAdminApi`** (`src/admin-api/http/client.ts`) calls `/api/admin/*`. On the server, one catch-all route (`src/app/api/admin/[...path]/route.ts`) matches method and path against the endpoint registry (`src/admin-api/endpoints/`). Each endpoint declares its id, method, path, permission, zod input, output and audit action, so there are no per-endpoint route files. An unknown path is 404 and a known path with the wrong method is 405.
 - **`DemoAdminApi`** (`src/admin-api/demo/`) runs entirely in the browser over an in-memory engine seeded with fictional data. It makes no `/api` calls, enforces the same permissions per role and returns the same error codes, so the demo behaves like the real console. It lives at `/demo`, which links into `/demo/console?as=admin|operator|viewer`; inside the console a "view as" switcher changes role and a reset button restores the seed.
-- **Every `/api/admin` request runs through `withAdmin`** (`core/http/with-admin.ts`): request id, CSRF guard and JSON-only body on non-GET requests, `requirePermission` against the database before input is parsed, a 64 KB body cap, zod validation, then the error envelope `{error:{code,message,requestId,issues?}}`. Responses carry `Cache-Control: no-store`. See `docs/security.md` for the full order and reasoning.
+- **Every `/api/admin` request runs through `withAdmin`** (`core/http/with-admin.ts`): request id, per-IP rate limit (before the CSRF guard and any session lookup), CSRF guard and JSON-only body on non-GET requests, `requirePermission` against the database before input is parsed, per-user rate limit (after authorization), a 64 KB body cap, zod validation, then the error envelope `{error:{code,message,requestId,issues?}}`. Over either limit the answer is 429 `RATE_LIMITED` with `Retry-After`; the limiter fails open. Responses carry `Cache-Control: no-store`. See `docs/security.md` for the full order and reasoning.
+- **Param routes and the system detail page.** A route entry in `src/features/routes.ts` may declare a `pattern` such as `systems/:id`. `findRoute` matches it segment by segment (a deeper or shallower path is unknown) and returns the route with its params, which the console router passes to the page. `systems/:id` has no navigation entry, so the navigation keeps its seven items, and it requires `systems:read`. Each system code in the Systems list links to it. The page (`?tab=overview|credentials`) shows credential counts (Active, Rotating, Expired, Revoked) that link to the Credentials tab filtered by that status, and the Credentials tab issues, rotates, revokes and (when enabled) reveals credentials. A card count and its list total come from the same `credentials.list` call, so they cannot drift.
 - **One contract suite, two implementations.** `test/contract/admin-api.contract.ts` defines the behaviour (counts match filtered lists, validation before side effects, viewers refused on every mutation, duplicate codes conflict) and runs against both `HttpAdminApi` (`test/contract/http.test.ts`) and `DemoAdminApi` (`test/contract/demo.test.ts`). A registry test checks that every endpoint has a permission and every mutation has an audit action.
 - **Capability flag.** `AdminApi.capabilities` lets an implementation say what it supports. Notifications exist in the demo only: `DemoAdminApi` reports `notifications: true`, `HttpAdminApi` reports `false` until a later phase adds a notifications table, and the bell and Notifications page render only when the flag is set.
 - **Auth boundary.** The admin layout (`src/app/admin/layout.tsx`) still performs the database-backed `requireActiveUser()` check and redirects to `/login`; the API is the gate on every call.
@@ -246,6 +254,9 @@ The admin console is one client UI (`src/features/*`, routed by `src/features/sh
 | Admin endpoint registry | `src/admin-api/endpoints/` |
 | Admin catch-all route | `src/app/api/admin/[...path]/route.ts` |
 | Admin request wrapper | `core/http/with-admin.ts` |
+| Edge proxy (request id, CSP, HSTS, CORS) | `src/proxy.ts`, `core/http/security-headers.ts` |
+| Credential lifecycle services | `core/services/credentials.ts`, `core/pure/credential-status.ts` |
+| System detail page | `src/features/systems/SystemDetailPage.tsx` |
 | HTTP and demo implementations | `src/admin-api/http/client.ts`, `src/admin-api/demo/` |
 | Console UI and routes | `src/features/`, `src/features/routes.ts` |
 | Contract suite | `test/contract/admin-api.contract.ts` |

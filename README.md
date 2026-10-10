@@ -15,7 +15,7 @@ Everything you do in the demo lives only in your browser. Refresh the page and i
 ## What it does
 
 - **Pluggable connectors.** A connector is a self-contained module with a small `execute` contract. Adding a connector type is a code change plus a rebuild; registering unlimited partner instances of an existing type is a pure UI action, with no redeploy.
-- **Config-driven, not hardcoded.** Systems, integration types, credentials, endpoints, and schedules live in the database. Outbound credentials are encrypted at rest with AES-256-GCM; inbound API keys are hashed. Everything is managed through the admin console.
+- **Config-driven, not hardcoded.** Systems, integration types, credentials, endpoints, and schedules live in the database. Outbound credentials are encrypted at rest with AES-256-GCM; inbound API keys, bearer tokens and Basic credentials are hashed. Everything is managed through the admin console.
 - **One governed inbound gateway.** External partners authenticate with an API key, bearer token or Basic credentials and are confined to their own system's routes. A partner cannot reach another partner's endpoints. Every request is rate-limited and logged.
 - **Provisioned-dormant by default.** A fresh deploy ships fully built but idle. Systems start in a setup state, no schedules are armed, notifications are off. Nothing runs, and nothing consumes recurring hosting quota, until a project explicitly activates it.
 - **Serverless-native job engine.** Inbound work runs inline. Outbound and scheduled work drains from a Postgres-backed queue with retry, backoff, and a dead-letter queue that supports replay. No Redis, no long-running worker.
@@ -36,7 +36,10 @@ partner request
 
 Built and working in the real application:
 
-- Inbound gateway with API key, bearer and Basic authentication (all three are verified today; screens to issue bearer and Basic credentials are planned for P2), per-system confinement, per-IP and per-system rate limiting (`X-RateLimit-*`, `Retry-After`, fail-open), request ids, idempotent retries, and an activity log row for every outcome.
+- Inbound gateway with API key, bearer and Basic authentication, per-system confinement (a credential presented on another system's route is refused with 403 and logged), per-IP and per-system rate limiting (`X-RateLimit-*`, `Retry-After`, fail-open), request ids, idempotent retries, and an activity log row for every outcome.
+- Credential lifecycle: issue API keys, bearer tokens and Basic credentials (optional label and expiry), rotate with an optional grace window, revoke, and list with Active, Rotating, Expired and Revoked status; store, rotate and revoke outbound credentials; labels are unique per system; revealing a stored outbound secret is off by default and needs both a permission and a server flag.
+- System detail page in the console: overview with credential status counts and a credentials tab for issuing, rotating, revoking and revealing.
+- Security headers: a per-request Content-Security-Policy with a nonce, HSTS over https, and CORS denied unless an origin allowlist is set; a per-IP and per-user rate limit on the admin API (429 with `Retry-After`, fail-open).
 - Encrypted credential vault, connector manifest, Postgres-backed job queue with retry, backoff, a dead-letter queue, stuck-job reclaim, and cron schedules fired exactly once by one signed QStash tick (dormant until an operator arms it).
 - Admin console with working sign-in, permission-based access control (checked against the database on every request, 8 hour sessions, throttled sign-in), and pages for systems, connectors, jobs, schedules and audit.
 - A typed admin API: one `AdminApi` contract, implemented over HTTP (`/api/admin/*`, one catch-all route driven by an endpoint registry, every request through `withAdmin`) and in the browser for the demo, behind a single client UI. One contract test suite runs against both implementations.
