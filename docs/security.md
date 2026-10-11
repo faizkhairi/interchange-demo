@@ -1,8 +1,8 @@
 # Security
 
-Last updated: 2026-10-10
+Last updated: 2026-10-11
 
-This document describes Interchange's security posture: how credentials are protected at rest, how inbound partner requests are authenticated and confined, how admin access is controlled, why the dormant-by-default posture is itself a security property, and what an attacker can and cannot do if a partner credential is compromised.
+This document describes Interchange's security posture: how credentials are protected at rest, how inbound partner requests are authenticated and confined, how outbound requests are kept away from internal networks, how admin access is controlled, why the dormant-by-default posture is itself a security property, and what an attacker can and cannot do if a partner credential is compromised.
 
 ## Credential vault
 
@@ -36,14 +36,17 @@ Admin login passwords (the `user` table) are hashed with bcrypt (`bcryptjs`, pur
 Every call into `/api/inbound/<systemCode>/<endpoint>` first passes the per-IP rate limit, then `authenticatePartner()` in `core/auth/with-partner-auth.ts`, before any connector code runs:
 
 1. **Extract the credential** from `x-api-key`, or an `Authorization: Bearer <token>` or `Authorization: Basic <base64>` header.
-2. **Resolve the system named in the URL first.** The `systemCode` path segment is looked up in `external_system` before the credential is checked against anything.
+2. **Resolve the system named in the URL first.** The `systemCode` path segment is looked up in `external_system` before the credential is checked against anything. Soft-deleted systems are excluded from that lookup, so a deleted system is an unknown system (see "Deleting and suspending systems" below).
 3. **Reject if the system is not `ACTIVE`.** A system in `SETUP` or `SUSPENDED` rejects all traffic, even if a valid credential exists for it. This is the dormant posture applied at the auth layer, not just at deploy time (see below).
 4. **Find the credential, then verify it in constant time.** An API key or bearer token is located by its `lookup_hash` (`system_api_key` or `system_bearer_token`) across all systems; a Basic credential is located by its keyed `username_lookup` (`system_basic_auth`). The salted hash is then verified with the constant-time comparison described above. A row that belongs to the URL's system is rejected with 401 if it is revoked or expired, and otherwise accepted, which stamps `last_used_at` on that credential. A live row that belongs to a different system is refused with 403 (see "Cross-system confinement" below). For Basic, the username and password comparisons both always run and are then combined, so timing does not reveal which half was wrong. A key or token that predates migration `0002` has no `lookup_hash` yet and is checked by a fallback scoped to the URL's own system.
-5. **Apply the per-system rate limit** (`external_system.rate_limit_rpm`) only after authentication succeeds.
+5. **Check the service token** when the system's integration type requires one (see "Service token" below). It runs after the partner credential, so a stranger learns nothing about the requirement.
+6. **Apply the per-system rate limit** (`external_system.rate_limit_rpm`) only after authentication succeeds.
+7. **Check the endpoint name and apply the endpoint limit**, if the system declares any (see "Endpoint names and limits" below).
+8. **Run the connector's input checks.** Resolve the handler, read `Idempotency-Key`, parse the JSON body, validate it strictly (see "Strict payloads" below) and only then create the job.
 
 ### Failure responses
 
-Every pre-auth failure (missing credential, unknown system, inactive system, wrong secret, revoked or expired credential) returns the same `401 {"error":"unauthorized"}`, so a caller cannot probe which system codes exist, which are active, or whether a credential was once valid. The one other authentication outcome is the confinement `403 {"error":"forbidden"}` described next. The real reason is recorded only in `activity_log`. Unknown and inactive systems also spend one hash computation so timing matches a wrong secret.
+Every pre-auth failure (missing credential, unknown or deleted system, inactive system, wrong secret, revoked or expired credential, a credential whose owning system is deleted) returns the same `401 {"error":"unauthorized"}`, so a caller cannot probe which system codes exist, which are active, or whether a credential was once valid. The other authentication outcomes are the confinement `403 {"error":"forbidden"}` described next and the service-token responses described under "Service token". The real reason is recorded only in `activity_log`. Unknown and inactive systems also spend one hash computation so timing matches a wrong secret.
 
 ### Cross-system confinement
 
@@ -51,6 +54,7 @@ Every pre-auth failure (missing credential, unknown system, inactive system, wro
 
 - The refusal is `403` only when a *live* credential proves its identity (its salted hash verifies) but belongs to a different system than the URL names. The response body is the generic `{"error":"forbidden"}`. The owning system's code is written only to the activity row (`ownerSystemCode`, with the reason `credential belongs to another system`) and never appears in a response.
 - A revoked or expired credential presented on another system is a plain `401`, indistinguishable from a wrong secret.
+- A credential whose owning system is soft-deleted counts as no row at all, for API keys, bearer tokens and Basic alike. Presented on another system's route it gets `401`, never `403`: a `403` would tell the holder of a stale credential that it was once real.
 - For Basic, `403` needs both the username and the password to match a live row of another system. A username match alone never yields `403`, so the status is no oracle for which usernames exist.
 - A key or token issued before migration `0002` has no `lookup_hash` until it is first used. It is checked only against the URL's own system, so on another system it is `401`, not `403`, until a successful use on its own system backfills the index.
 - Because a `403` requires a verified secret, it tells nothing to a caller who does not already hold a valid credential. To a holder of a live key it does confirm that the system code in the URL exists; this is accepted by design, since that caller already holds a credential for this platform.
@@ -61,6 +65,77 @@ Every pre-auth failure (missing credential, unknown system, inactive system, wro
 - **`username_lookup`** (`system_basic_auth`, non-unique): a Basic username has low entropy, so a plain digest would let a leaked index be brute-forced back to usernames. The index is an HMAC-SHA256 of the username under a subkey derived from `CREDENTIAL_MASTER_KEY`, so without the key it cannot be reversed. It is not unique because a rotation grace window can hold two rows for one username.
 - **Rotation window.** While `CREDENTIAL_MASTER_KEY_PREVIOUS` is set, the gateway computes the username lookup under both keys (current first) and matches a row indexed under either. When a row of the URL's own system authenticates and its stored lookup is not the current-key value, it is re-indexed to the current key. A row that is not used during the window stays indexed under the previous key, so keep `CREDENTIAL_MASTER_KEY_PREVIOUS` set until every Basic credential in use has authenticated once, or reissue it. Once the previous key is removed, a row still indexed under it is no longer found and gets `401`.
 - **Rows that predate migration `0002`.** SQL cannot compute the HMAC, so `username_lookup` is NULL for existing Basic rows, and `lookup_hash` is NULL for existing keys and tokens. The gateway verifies such rows only against the URL's own system, and on a match fills in the index (or moves `username_lookup` to the current key), so legacy rows upgrade on first use.
+
+## Service token
+
+Some partners are called by a backend job rather than a person, and a project may want a second, short-lived proof on top of the partner's long-lived key. Each integration type carries an `auth_policy`:
+
+| Policy | Meaning |
+|---|---|
+| `partner` (default) | The partner credential alone authenticates the call. |
+| `partner+service` | The partner credential must pass first, and the request must also carry a valid service token in the `X-Service-Token` header. |
+
+The policy belongs to the type, so every system of that type follows it. An admin sets it when registering a type, or later with `integrationTypes.setAuthPolicy` (`systems:write`, audited as `integration_type.set_auth_policy`). In production, choosing `partner+service` while `SERVICE_JWT_SECRET` is not configured is refused with `409 CONFLICT`, so the policy cannot be switched on into a gateway that would turn everyone away.
+
+The token is a JWT, verified in `core/auth/service-token.ts`:
+
+- **Algorithm.** HS256 only, under `SERVICE_JWT_SECRET`. `none`, HS512 and every other algorithm are refused. A secret shorter than 32 bytes counts as unset.
+- **Claims.** `aud` must be `interchange-inbound`. `sub`, `iat` and `exp` are required. `sys` is optional.
+- **Lifetime.** `exp - iat` is at most 900 seconds, and a token issued in the future beyond the tolerance is refused. Clock tolerance is 30 seconds.
+- **Scope.** When `sys` is present it must equal the system code in the URL. Without `sys`, a token is valid for any system that uses the policy, so mint tokens with `--sys`.
+
+What the caller sees, always after the partner credential has passed:
+
+| Situation | Response | Activity reason (never in the response) |
+|---|---|---|
+| Header missing | `401 {"error":"unauthorized"}` | missing service token |
+| Bad signature, wrong algorithm, wrong audience, missing claim | `401 {"error":"unauthorized"}` | invalid service token |
+| Expired | `401 {"error":"unauthorized"}` | service token expired |
+| Lifetime over 900 s | `401 {"error":"unauthorized"}` | service token lifetime too long |
+| `sys` names another system | `403 {"error":"forbidden"}` | service token for another system |
+| Secret unset or under 32 bytes | `503 {"error":"service unavailable"}` | service auth not configured |
+
+The 503 is fail closed: the policy cannot be met, so nobody gets in, and the cause is logged server-side. Claims are never echoed in a response or a reason. On success the activity row's `authMethod` is the partner method with `+service` appended.
+
+**A service token is never accepted as a partner credential.** It proves nothing on its own. A Bearer value that matches no partner credential is also tested against the service secret (only when it looks like a JWT and the secret is configured). If its signature verifies, with claims ignored so an expired or other-system token counts too, the request is refused with `401` and the activity reason "service token presented as partner credential". It is never `403`, and the test runs only after the credential lookup has missed. It exists to make a misconfigured client visible in the log; it does not create a path that authenticates.
+
+**Minting.** `npm run mint:service-token -- --sub worker-1 --sys ACME-ERP --ttl 300` reads `SERVICE_JWT_SECRET` from the environment and prints only the token. `--sub` is required, `--ttl` is 1 to 900 seconds (default 300). Failures go to stderr and never echo the secret.
+
+**Accepted risk: replay inside the lifetime.** There is no `jti` store. Tokens are stateless, so a captured token can be replayed until it expires: at most 900 seconds plus the 30 second tolerance. An attacker who replays one still needs a valid partner credential for the same system, because the service token is a second factor and not a replacement. Keep tokens short (the script defaults to 300 seconds) and send them over https only.
+
+**One secret, no overlap.** There is a single `SERVICE_JWT_SECRET` and no previous-key slot, so changing it invalidates every outstanding token at once. Tokens live minutes, so the practical effect is that callers mint a fresh one.
+
+## Deleting and suspending systems
+
+A system is soft-deleted from the console, or with `POST /systems/:id/delete` (`systems:write`), from any status. Delete sets `deleted_at` and `status = SUSPENDED` in one statement, and the audit row records the previous status. Restore clears `deleted_at` and leaves the system `SUSPENDED`, so a restore never resumes live traffic by itself: an operator must set it `ACTIVE`. Restore is refused with `409` while the system's integration type is deleted. Integration types can be soft-deleted too, but not while a non-deleted system uses them, and a deleted type cannot be chosen for a new, imported or duplicated system.
+
+- **Deleted is unknown at the gateway.** The URL lookup excludes deleted systems, so a deleted system's URL gets the same `401` as one that never existed, with the same dummy hash cost.
+- **A deleted owner's credential is `401`, never `403`.** The owner join treats a deleted owner as no row, for API keys, bearer tokens and Basic (see "Cross-system confinement").
+- **Mutations are refused.** On a deleted system, edit, status change, credential issue, rotate, store and Basic set, endpoint config, health check, duplicate, arming a schedule and replaying a DLQ entry all answer `409 CONFLICT` "system is deleted". Reads, export and credential revoke still work, because revoking only reduces exposure. Jobs, DLQ, audit and activity history of a deleted system stay listed.
+- **Suspend and delete stop background work, with no catch-up.**
+  - *Schedules.* The tick fires a schedule only for a live, `ACTIVE` system. Any other due schedule has its `next_run_at` advanced to the next cron slot with nothing enqueued, so activating or restoring a system later never produces a burst of fires for slots that passed while it was off.
+  - *Queued jobs of a `SUSPENDED` or `SETUP` system are held.* The drain does not claim them: they stay pending with their attempt count unchanged, and they do not take a batch slot from other systems. They run once the system is set `ACTIVE`.
+  - *Queued jobs of a deleted system fail without retry* ("system deleted") and land in the DLQ, where replay is refused while the system stays deleted.
+- **Deleted codes stay reserved.** `external_system.system_code` and `integration_type.code` stay unique across soft-deleted rows. Creating, importing or duplicating with a deleted system's code answers `409 CONFLICT` "system code already exists (deleted)", and the same rule covers type codes. There is no code reuse on purpose: old credentials, jobs, audit rows and activity rows all point at the code, and reuse would attach a former partner's history to a new one. To use the code again, restore the row.
+
+## Endpoint names and limits
+
+The last segment of `/api/inbound/<systemCode>/<endpoint>` is validated before anything else uses it:
+
+- **Normalisation.** The segment is Unicode NFC, then lower-cased, then must match `^[a-z0-9._-]{1,64}$`. Anything else is `404 {"error":"unknown endpoint"}`.
+- **Limits are stored the same way.** A per-endpoint limit (`endpoint_rate_limit`) is an endpoint name plus a requests-per-minute value from 1 to 100000, up to 50 per system. Names are stored lower-cased under a unique index and a CHECK on the same pattern, so `Orders` and `orders` can never be two limits. Save and import apply the same normalisation.
+- **Declaring any endpoint limit turns the list into the system's endpoint allowlist.** The segment is free text that reaches the same handler, so a limit keyed on the raw text would be bypassed by respelling it (`Orders`, `orders2`, `orders.`). Instead, once a system has at least one limit row, any segment outside that set is `404` "unknown endpoint". The check runs after authentication, so strangers learn nothing. The request is logged with that reason, creates no job and spends no counter. A system with no rows accepts any valid segment.
+- **Counting.** A listed endpoint consumes the bucket `sys:<systemCode>:<endpoint>`. Over the limit the answer is `429` with `Retry-After` and the activity reason "rate limited (endpoint)". The per-system limit still caps everything, and the `X-RateLimit-*` headers report the tightest bucket the request consumed.
+
+## Strict payloads
+
+The gateway validates the body against the connector's zod schema with the top level strict:
+
+- **Unknown top-level keys are refused**, not dropped: `422 {"error":"payload validation failed","unknownKeys":["extra"],"details":{...}}`. Names are sorted, at most 20 are listed and each is cut at 64 characters; `unknownKeysTruncated: true` marks a longer list. Values are never reported. The activity row stores `{"reason":"unknown keys","unknownKeys":[...]}` only, so a secret sent under a misspelled key is not written to the log.
+- **Other validation failures** keep zod's `flatten` shape in `details`, but every message comes from one no-echo mapper: an enum failure lists the allowed values and never the submitted one.
+- **Only the top level is strict.** Nested objects follow the connector's own schema.
+- **Same rule for a manual run.** `jobs.run` in the admin API refuses an unknown payload key with a validation issue `unrecognized_keys` under `payload`. The drain keeps a lenient parse of payloads already stored, so rows queued before this rule never dead-letter on it.
+- **Fail closed on the schema itself.** A connector whose input schema is not a plain object, or uses a catch-all, cannot be checked for unknown keys. The gateway answers `500 {"error":"internal error"}` and a registry test asserts every shipped schema is an object.
 
 ## Credential lifecycle
 
@@ -73,8 +148,51 @@ Inbound credentials (API key, bearer token, Basic) and outbound credentials (enc
 - **Rotate.** `POST /credentials/:kind/:credId/rotate`. For inbound kinds it creates a successor with the same label and a new server-generated secret, returned once; Basic keeps its username and gets a new password. `graceMinutes` (0 to 1440, default 0) decides what happens to the old row. With 0 it is revoked at once. Otherwise it keeps working until the grace ends (or until its own earlier expiry), shows as `ROTATING`, then becomes `EXPIRED`. The successor inherits the original lifetime, so a 30 day key rotates into a 30 day key and a key without expiry stays without one. The old row is updated before the successor is inserted, in one transaction, because the unique index would otherwise reject the new row. A revoked, expired or already rotated credential answers `409`. An outbound rotation needs a new `secret`, re-encrypts it in place under the same label and stamps `rotated_at`; it has no grace window. An inbound rotation refuses a supplied `secret`.
 - **Revoke.** `POST /credentials/:kind/:credId/revoke` sets `revoked_at`. It takes effect on the next request: the gateway answers `401`, and a revoked outbound credential drops out of the resolved connector config. Revoking a credential also revokes any predecessor still inside its rotation grace, so revoking the successor closes the whole chain. It is deliberately not idempotent: a second revoke answers `409`, so a double click or a stale screen is visible rather than silently accepted.
 - **Reveal (off by default).** Only outbound credentials can be revealed; inbound secrets are hashed and cannot be recovered. Two independent switches must both be on: the user holds `credentials:reveal`, and the server has `CREDENTIALS_REVEAL_ENABLED=1`. The second exists because the `admin` role holds `*`, so a permission alone could never make reveal off by default. With the variable unset, even an admin gets `403 FORBIDDEN` ("Reveal is disabled"), checked before any lookup. A revoked credential answers `409`. Reveal is fail-closed: the plaintext is returned only after the `credential.reveal` audit row (the label, never the value) has committed, so a reveal that cannot be audited does not happen. Reveal also has its own per-user throttle, `CREDENTIALS_REVEAL_LIMIT` reveals per 10 minutes (default 10), on top of the admin rate limit. `GET /api/admin/me` reports `features.credentialReveal`, so the console hides the Reveal action when the server has it off.
-- **Listing.** `GET /systems/:id/credentials` (`systems:read`) takes `status`, `kind` and `offset`, and returns at most 50 rows with a `total` for the same filters. Rows are mapped through the status function first and filtered second, so a status count and the list behind it always agree. A response never includes a secret, hash or salt.
+- **Listing.** `GET /systems/:id/credentials` (`systems:read`) takes `status`, `kind` and `offset`, and returns at most 50 rows with a `total` for the same filters. Rows are mapped through the status function first and filtered second, so a status count and the list behind it always agree. A response never includes a secret, hash or salt. `GET /credentials/expiring` (`systems:read`) lists the `ACTIVE` inbound credentials of live systems that expire within the next 30 days, soonest first, and the dashboard's "expiring" count is that list's total.
 - **Console.** The system detail page (`systems/<id>`, reached from the Systems list) has an Overview tab with Active, Rotating, Expired and Revoked counts that link to the Credentials tab filtered by that status. The Credentials tab lists the credentials and offers Issue, Rotate (with a grace field), Revoke and, when enabled, Reveal. A new secret is shown once. A viewer sees no mutation controls.
+
+## Outbound request guard (SSRF)
+
+Interchange makes requests to URLs an administrator typed: a system's `baseUrl` (outbound connectors) and its `healthUrl`. A mistyped or malicious URL that points at loopback, a private network or a cloud metadata address would turn the platform into a proxy into places it can reach and the partner cannot. Every such request goes through `safeFetch` in `core/net/ssrf.ts`, and a connector must not call `fetch` itself (see `docs/connectors.md`).
+
+**What is blocked.** The classifier is `core/pure/address-policy.ts`, pure and shared with the in-browser demo:
+
+- IPv4: `0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10` (carrier-grade NAT), `127.0.0.0/8`, `169.254.0.0/16` (link-local, which includes the cloud metadata address), `172.16.0.0/12`, `192.0.0.0/24`, `192.0.2.0/24`, `192.88.99.0/24` (6to4 relay), `192.168.0.0/16`, `198.18.0.0/15`, `198.51.100.0/24`, `203.0.113.0/24`, `224.0.0.0/4` (multicast) and `240.0.0.0/4` (reserved, includes broadcast).
+- IPv6: `::/96` (unspecified, loopback and IPv4-compatible), `fc00::/7`, `fe80::/10`, `fec0::/10`, `ff00::/8`, `2001::/32` (Teredo), `2001:db8::/32`, `2002::/16` (6to4) and `64:ff9b:1::/48`. IPv4-mapped (`::ffff:a.b.c.d`, also written `::ffff:7f00:1`) and NAT64 (`64:ff9b::/96`) addresses are judged by the IPv4 address inside them.
+- Names: `localhost`, `*.localhost`, `*.local` and `*.internal`.
+- Anything that does not parse as a canonical address is `blocked:invalid`, never public. Dotted quads with leading zeros are refused because some stacks read them as octal. Numeric spellings such as `2130706433` and `0x7f.1` are normalised to `127.0.0.1` by the URL parser before the check, so they are caught.
+
+**When it is checked.**
+
+1. *At save.* `baseUrl` and `healthUrl` get syntax, scheme, literal-address and reserved-name checks, with no DNS, so an obvious mistake fails in the form with the issue code `ssrf_blocked`. The demo applies the same rules. On the server, http is refused at save when `NODE_ENV` is `production`; the demo always refuses it. A hostname that merely resolves to a private address is not caught at save, only at use.
+2. *Preflight, at use.* In production only https is allowed. The host is resolved to every address, and the request is refused if any one of them is blocked.
+3. *At connect time.* The HTTP client dials through a lookup that resolves again and refuses any blocked answer, so the address actually dialled is the one that was judged. A DNS answer that is public at preflight and private at connect (rebinding) fails with `BLOCKED`. An IP-literal host skips that lookup in the socket layer, which is why the preflight judges literals itself.
+4. *Redirects are never followed.* A `3xx` is returned to the caller, and the `rest-outbound` connector treats it as a non-retryable failure.
+5. *Every call is bounded by a timeout:* the system's `timeout_ms` for connectors, 5 seconds for the health check.
+
+**Fixed error codes.** Failures surface as one of six codes with a fixed message. Nothing the upstream said (resolver text, socket errors, TLS details, response bodies) is copied into an error, a job log or a health reason, so callers can log and store them safely.
+
+| Code | Meaning | `rest-outbound` result |
+|---|---|---|
+| `BLOCKED` | A blocked address or reserved name | `FAILED`, not retried |
+| `INVALID_URL` | Not an absolute URL, scheme not allowed, http in production, no host | `FAILED`, not retried |
+| `DNS` | The host did not resolve | `FAILED`, not retried |
+| `TIMEOUT` | The timeout elapsed | `RETRY` |
+| `CONNECT` | The connection failed | `RETRY` |
+| `TLS` | Handshake or certificate failure | `RETRY` |
+
+The first three are configuration problems that a retry cannot fix. The last three are treated as transient on the partner side.
+
+**Consumers.** The `rest-outbound` connector and the system health check (`systems.checkHealth`, `systems:write`): a `GET` with a 5 second timeout whose body is cancelled unread. A `2xx` stores `UP`; anything else stores `DOWN` with a `health_reason` that is a guard code or `HTTP_<status>`, never an upstream body or message. Any future outbound connector must use `safeFetch` too. A test-only policy override exists so tests can run positive controls against a local server; it is ignored when `NODE_ENV` is `production` and no route can reach it.
+
+## Importing and exporting systems
+
+`GET /systems/:id/export` returns a JSON document describing one system's configuration, `POST /systems/import` creates a system from one, and `POST /systems/:id/duplicate` copies one inside the platform.
+
+- **No secrets, by construction.** The export query reads no credential table and the document schema has no field for a credential. A duplicate never reads a credential table either, so the copy starts with none. Imported and duplicated systems land in `SETUP`, so nothing is reachable until credentials are issued and an operator activates the system.
+- **Strict at every level.** The document schema refuses an unknown key anywhere: a smuggled `apiKey` or an extra `endpointConfig` field is a validation error with an `unrecognized_keys` issue at that path, not a silently ignored field.
+- **`endpointConfig.settings` is free-form.** It is exported as stored, so keep secrets out of it. Store them with "Store credential", which encrypts them in the vault.
+- **Audited.** Import, duplicate and delete write `system.import`, `system.duplicate` and `system.delete` rows.
 
 ## RBAC (admin console)
 
@@ -124,7 +242,7 @@ For each request the proxy:
 1. resolves the request id (a valid `X-Request-ID` is kept, otherwise a fresh UUID is generated) and puts it on the forwarded request and the response, where `withAdmin` and the inbound route reuse it;
 2. generates a nonce and forwards it as `x-nonce` and inside the request's `Content-Security-Policy`, which is how Next attaches the nonce to its own scripts; the root layout puts the same nonce on the one inline theme script;
 3. sets the `Content-Security-Policy` on the response, plus HSTS over https;
-4. applies the CORS rule below to `/api/*`.
+4. applies the env-list CORS rule below to `/api/*`, except `/api/inbound/*`, which it leaves alone: the inbound route answers CORS itself, per system.
 
 ### Content-Security-Policy
 
@@ -153,14 +271,25 @@ upgrade-insecure-requests        (https requests only)
 
 ### CORS
 
-CORS is **deny-all unless configured**, in every environment.
+CORS is **denied by default**, in every environment, and two rules apply depending on the path. Neither ever enables credentialed requests, and `/api/admin/*` is outside both.
 
-- It applies to `/api/*` and only to a cross-origin request (an `Origin` header that differs from the request's own origin). Same-origin requests and requests with no `Origin` are untouched.
+**1. The env list: every `/api/*` path except `/api/inbound/*` and `/api/admin/*`.**
+
+- It applies only to a cross-origin request (an `Origin` header that differs from the request's own origin). Same-origin requests and requests with no `Origin` are untouched.
 - `CORS_ALLOWED_ORIGINS` is a comma-separated list of exact origins (scheme, host and port). Unset or empty allows nothing. Entries that are not an `http` or `https` origin, including `*`, are dropped, so a wildcard cannot be configured by accident.
 - A request from an allowed origin gets `Access-Control-Allow-Origin` set to that exact origin, plus `Vary: Origin`. Any other cross-origin request gets no `Access-Control-Allow-Origin`, so the browser blocks the response.
-- A cross-origin `OPTIONS` preflight is answered by the proxy itself with `204`. For an allowed origin it also carries `Access-Control-Allow-Methods: POST, OPTIONS`, `Access-Control-Allow-Headers: Authorization, Content-Type, X-API-Key, X-Request-ID, Idempotency-Key` and `Access-Control-Max-Age: 600`; for any other origin it carries no `Access-Control-Allow-*` header.
+- On these paths a cross-origin `OPTIONS` preflight is answered by the proxy itself with `204`. For an allowed origin it also carries `Access-Control-Allow-Methods: POST, OPTIONS`, `Access-Control-Allow-Headers: Authorization, Content-Type, X-API-Key, X-Request-ID, Idempotency-Key, X-Service-Token` (one shared constant for both rules) and `Access-Control-Max-Age: 600`; for any other origin it carries no `Access-Control-Allow-*` header.
 - `/api/admin/*` never gets any CORS header, whatever the allowlist says. The admin API does its own same-origin CSRF check and is not meant for other origins. The path is normalised (decoded, lower-cased, repeated slashes collapsed) before this check, and an undecodable path is treated as admin.
-- Credentialed CORS (`Access-Control-Allow-Credentials`) is never enabled. Per-system origin lists are planned, not built.
+- Credentialed CORS (`Access-Control-Allow-Credentials`) is never enabled, on any path.
+
+**2. The system's own list: `/api/inbound/*`.** The proxy neither answers nor decorates these paths. The inbound route decides per system, because a partner's browser origin belongs to that partner and not to the whole platform.
+
+- Each system has a `cors_origins` list, edited on the CORS tab of its detail page (`systems.update`, `systems:write`). Entries follow the same rules as the env list: exact `http` or `https` origins, `*` impossible, at most 20. An invalid entry is rejected at save with a validation error at its index, not silently dropped. Every list starts empty, so the default is still deny.
+- **Preflight.** A cross-origin `OPTIONS` first spends the per-IP rate limit, then looks up the system by code. Only a live (not deleted), `ACTIVE` system whose list contains the origin gets `204` with `Access-Control-Allow-Origin` set to that exact origin, `Access-Control-Allow-Methods`, `Access-Control-Allow-Headers` (the headers the gateway reads, now including `X-Service-Token`), `Access-Control-Max-Age` and `Vary: Origin`.
+- **The env list is a ceiling.** When `CORS_ALLOWED_ORIGINS` is set, an origin must be in both the system's list and the env list. When it is unset, the system's list governs alone, so a partner origin needs one edit, not two.
+- **No oracle.** An unknown system, a deleted system, a system that is not `ACTIVE`, an origin that is not listed, and an origin the env ceiling excludes all get the same answer: `204` with `Vary: Origin` and no `Access-Control-Allow-Origin`. A script cannot use preflight to learn which system codes exist or which origins are registered.
+- **Actual responses.** Every `POST` response carries `Vary: Origin`. It carries `Access-Control-Allow-Origin` (and `Access-Control-Expose-Headers` for `Retry-After`, the `X-RateLimit-*` set, `X-Request-ID` and `Idempotent-Replayed`) only once the partner credential has authenticated and the origin is allowed. A `401` from the partner credential check never carries it, so a browser caller with a bad key sees an opaque CORS error rather than a hint that the system exists.
+- **CORS is not authentication.** An allowed origin only lets browser script read the response; every request still needs the partner credential. List a browser origin only when partner credentials are meant to be used from browser code.
 
 ## Job endpoint authentication
 
@@ -168,7 +297,15 @@ CORS is **deny-all unless configured**, in every environment.
 
 ## Rate limiting and activity logging
 
-Inbound traffic is limited per client IP (taken from `x-vercel-forwarded-for`, then `x-real-ip`, then the first `x-forwarded-for` entry, validated as an IP address, else `unknown`) (`RATE_LIMIT_IP_RPM`, default 250 per minute) and per system (`external_system.rate_limit_rpm`), using one atomic upsert per request against `rate_limit_bucket`. A rejected call returns 429 with `Retry-After`. The limiter fails open if the database is unreachable (a logged warning), trading brief over-admission for availability. Every inbound outcome, including 401, 429 and validation failures, writes an `activity_log` row with the request id, status, timing and both payloads; secret-looking body keys (case-insensitive, recursive) are redacted, rows older than `ACTIVITY_RETENTION_DAYS` (default 30) are pruned by the tick, and credentials or `Authorization` headers are never stored.
+Inbound traffic is limited per client IP (taken from `x-vercel-forwarded-for`, then `x-real-ip`, then the first `x-forwarded-for` entry, validated as an IP address, else `unknown`) (`RATE_LIMIT_IP_RPM`, default 250 per minute) per system (`external_system.rate_limit_rpm`) and, for a system that declares endpoint limits, per endpoint (see "Endpoint names and limits"), using one atomic upsert per bucket per request against `rate_limit_bucket`. A rejected call returns 429 with `Retry-After`. The limiter fails open if the database is unreachable (a logged warning), trading brief over-admission for availability. Every inbound outcome, including 401, 429 and validation failures, writes an `activity_log` row with the request id, status, timing and both payloads; secret-looking body keys (case-insensitive, recursive) are redacted, rows older than `ACTIVITY_RETENTION_DAYS` (default 30) are pruned by the tick, and credentials or `Authorization` headers are never stored. A 422 caused by unknown payload keys stores the key names only, never the values.
+
+### Rate-limit monitor
+
+`GET /rate-limits` (`systems:read`, the "Rate limits" page) shows the current one-minute window's gateway buckets and the `429` responses of the last hour.
+
+- **Gateway buckets only.** Only `ip:` and `sys:` buckets (system and endpoint) are shown. `admin:*` buckets are never returned, because their keys carry user ids.
+- **IPs are truncated on the server.** Client addresses are personal data and the page is open to the read-only viewer role, so every address in the monitor (bucket scope and rejected events) is cut to its /24 (IPv4) or /48 (IPv6) before it leaves the endpoint, in the live console and the demo alike. `ip:` buckets are grouped by that prefix: one row per prefix with the summed count, the number of addresses, and the highest single-address count measured against the per-IP limit, so a prefix never shows as one bucket with a misleading ratio. An IPv4-mapped IPv6 address is unwrapped before truncation, and the `unknown` sentinel is shown as is.
+- **Rejected events** come from `activity_log` rows with `direction = 'inbound'`, not a test call, and response code 429 in the last hour, newest first, 50 per page. One helper counts them for both the list total and the dashboard card, so an outbound partner 429 or a test row can never inflate either.
 
 ## Audit logging
 
@@ -180,6 +317,7 @@ The provisioned-dormant default is described in `docs/architecture.md` as a cost
 
 - A freshly deployed Interchange instance, even one seeded with real connector types and even one where an operator has (prematurely, or by mistake) issued API keys for a partner system, **rejects all inbound traffic for that system** until an operator explicitly sets `status = 'ACTIVE'`. There is no state between "provisioned" and "live" where a half-configured system quietly accepts requests.
 - No outbound schedule fires and no drain runs on a timer until QStash is explicitly armed (`QSTASH_TOKEN` set and the platform tick armed from the Schedules page; arming a single schedule registers nothing with QStash; the job endpoints additionally require signed requests). A deploy with a misconfigured or forgotten schedule does not leak outbound traffic; it does nothing.
+- Leaving the live state also stops a system's background work. A `SUSPENDED` or `SETUP` system fires no schedules and has its queued jobs held, and a deleted system's queued jobs fail; nothing catches up when it is activated or restored (see "Deleting and suspending systems").
 - This means the platform's default failure mode, for both a fresh deploy and a partially configured one, is silence rather than partial exposure.
 
 ## Threat model: a compromised partner credential
@@ -189,7 +327,7 @@ This section describes what an attacker who obtains a valid, active API key or b
 **Can do:**
 
 - Call any inbound endpoint (`/api/inbound/<systemCode>/<endpoint>`) that belongs to *that specific system*, as many times as the per-system rate limit and the connector's own logic allow.
-- Submit any payload that satisfies the connector's zod `inputSchema`. If the schema is permissive (for example, the `rest-inbound` template accepts an arbitrary `data` record), the attacker can submit arbitrary data within that shape.
+- Submit any payload that satisfies the connector's zod `inputSchema` with no unknown top-level keys (unknown keys are refused, see "Strict payloads"). If the schema is permissive (for example, the `rest-inbound` template accepts an arbitrary `data` record), the attacker can submit arbitrary data within that shape.
 - Cause jobs to be created and connector `execute()` logic to run for that system, including any side effects that connector performs (writes, downstream calls, file drops).
 - Read whatever the connector's response returns to the caller (the `output` of a successful `execute()`, or error detail on a validation failure).
 
@@ -197,8 +335,12 @@ This section describes what an attacker who obtains a valid, active API key or b
 
 - Authenticate as, or submit requests on behalf of, any *other* partner system. A stolen credential is scoped to exactly one `external_system`: presented on another system's route it is recognised and refused with 403 (logged with the owning system in the activity row), never accepted. See "Inbound authentication and cross-system confinement" above.
 - Decrypt any outbound credential Interchange holds for that system, or any other system. Inbound API keys and bearer tokens are hashed, not encrypted; there is no reverse operation from a hash back to the original secret, so possessing (or even fully dumping) the `system_api_key` table does not expose usable plaintext credentials (the unsalted `lookup_hash` beside the salted hash is a SHA-256 of a 192-bit random secret, so it does not change that), and the outbound `system_credential` vault is a separate, independently protected store.
+- Call a system whose integration type uses the `partner+service` policy with the partner credential alone: the service token is required as well, and it cannot be presented as the partner credential.
+- Reach a deleted system. Its URL is an unknown system and its credentials are `401`.
 - Reactivate a `SUSPENDED` or `SETUP` system. Status is controlled only through the admin console (`requirePermission()`-gated), never by the inbound path itself.
 - Access the admin console. Partner credentials and admin user sessions are entirely separate authentication mechanisms (`with-partner-auth.ts` vs `next-auth` + `rbac.ts`); a partner API key is never accepted as an admin session token.
 - Erase evidence of its own activity. Every request produces an `activity_log` row, and every request that reaches a connector also produces a `job` row and associated `job_log` entries; these are platform-owned and not writable by the caller.
 
 **Net exposure of a single compromised credential**: everything one partner system's own connector logic can be made to do, once, repeatedly, until the key is revoked. It does not expose other partners, does not expose the credential vault, and does not grant any administrative capability. Revoking the specific credential, from the system's Credentials tab in the console or with `POST /api/admin/credentials/:kind/:credId/revoke`, sets `revoked_at` and immediately closes that path without affecting any other system. Rotating with a grace of 0 does the same while issuing a replacement, and a credential with an expiry stops working on its own at `expires_at`.
+
+**A leaked `SERVICE_JWT_SECRET`** lets its holder mint service tokens for the systems that use the `partner+service` policy, and for any of them when `sys` is omitted. It does not authenticate anything by itself: the partner credential is still required. Rotate the secret (all outstanding tokens stop working) and review the activity log for `+service` calls.

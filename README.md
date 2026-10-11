@@ -26,7 +26,8 @@ Everything you do in the demo lives only in your browser. Refresh the page and i
 partner request
    -> inbound gateway rate-limits by IP, then authenticates the caller (API key / bearer / basic)
       and confirms the URL system code matches the caller (no cross-system access)
-   -> the per-system rate limit is applied; the system must be ACTIVE (a dormant system rejects traffic)
+   -> if the system's integration type requires it, a short-lived service token must be presented as well
+   -> the per-system rate limit (and any per-endpoint limit) is applied; the system must be ACTIVE (a dormant system rejects traffic)
    -> the bound connector validates the payload against its schema
    -> the connector runs; a job row records the outcome
    -> every outcome (including rejections) is logged; outbound/scheduled work drains from a queue with retry + DLQ
@@ -36,17 +37,20 @@ partner request
 
 Built and working in the real application:
 
-- Inbound gateway with API key, bearer and Basic authentication, per-system confinement (a credential presented on another system's route is refused with 403 and logged), per-IP and per-system rate limiting (`X-RateLimit-*`, `Retry-After`, fail-open), request ids, idempotent retries, and an activity log row for every outcome.
+- Inbound gateway with API key, bearer and Basic authentication, per-system confinement (a credential presented on another system's route is refused with 403 and logged), per-IP and per-system rate limiting (`X-RateLimit-*`, `Retry-After`, fail-open), request ids, idempotent retries, and an activity log row for every outcome. Also: an optional short-lived service token as a second credential per integration type, per-endpoint limits that double as an endpoint allowlist, strict payloads (unknown keys are refused by name), and per-system CORS origin lists.
 - Credential lifecycle: issue API keys, bearer tokens and Basic credentials (optional label and expiry), rotate with an optional grace window, revoke, and list with Active, Rotating, Expired and Revoked status; store, rotate and revoke outbound credentials; labels are unique per system; revealing a stored outbound secret is off by default and needs both a permission and a server flag.
-- System detail page in the console: overview with credential status counts and a credentials tab for issuing, rotating, revoking and revealing.
-- Security headers: a per-request Content-Security-Policy with a nonce, HSTS over https, and CORS denied unless an origin allowlist is set; a per-IP and per-user rate limit on the admin API (429 with `Retry-After`, fail-open).
+- System detail page in the console: overview with credential status counts, a credentials tab for issuing, rotating, revoking and revealing, and tabs for endpoint config and limits, CORS origins and health.
+- System lifecycle: soft delete and restore (a deleted system is unknown at the gateway, and its code stays reserved), duplicate, and export and import of a system's configuration (never any credential). Suspended systems fire no schedules and hold their queued jobs, with no catch-up when they resume.
+- Outbound SSRF guard: URLs the platform calls (connector base URLs, health URLs) are checked against private and reserved address ranges before connecting and again at connect time, redirects are not followed, and failures surface as fixed codes.
+- Operations screens: a rate-limit monitor (current buckets and the last hour of 429s, client IPs truncated), an expiring-credentials list, a health check per system, and a Gateway section on the dashboard.
+- Security headers: a per-request Content-Security-Policy with a nonce, HSTS over https, and CORS off unless an origin is allowed (an env allowlist for `/api/*`, each system's own origin list for inbound); a per-IP and per-user rate limit on the admin API (429 with `Retry-After`, fail-open).
 - Encrypted credential vault, connector manifest, Postgres-backed job queue with retry, backoff, a dead-letter queue, stuck-job reclaim, and cron schedules fired exactly once by one signed QStash tick (dormant until an operator arms it).
 - Admin console with working sign-in, permission-based access control (checked against the database on every request, 8 hour sessions, throttled sign-in), and pages for systems, connectors, jobs, schedules and audit.
 - A typed admin API: one `AdminApi` contract, implemented over HTTP (`/api/admin/*`, one catch-all route driven by an endpoint registry, every request through `withAdmin`) and in the browser for the demo, behind a single client UI. One contract test suite runs against both implementations.
 - Manual job run and DLQ replay from the console, gated by the `jobs:run` and `jobs:retry` permissions.
 - CI on every push: typecheck, lint, tests (against an in-memory Postgres) and build.
 
-Planned, not built yet: user and role management screens, per-endpoint rate limits, a rate-limit monitor, DLQ discard and notes screens, log and activity viewers, alerting, an API playground and generated OpenAPI docs.
+Planned, not built yet: user and role management screens, DLQ discard and notes screens, log and activity viewers, alerting, an API playground and generated OpenAPI docs.
 
 ## Architecture and security
 
