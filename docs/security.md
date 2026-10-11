@@ -75,7 +75,7 @@ Some partners are called by a backend job rather than a person, and a project ma
 | `partner` (default) | The partner credential alone authenticates the call. |
 | `partner+service` | The partner credential must pass first, and the request must also carry a valid service token in the `X-Service-Token` header. |
 
-The policy belongs to the type, so every system of that type follows it. An admin sets it when registering a type, or later with `integrationTypes.setAuthPolicy` (`systems:write`, audited as `integration_type.set_auth_policy`). In production, choosing `partner+service` while `SERVICE_JWT_SECRET` is not configured is refused with `409 CONFLICT`, so the policy cannot be switched on into a gateway that would turn everyone away.
+The policy belongs to the type, so every system of that type follows it. It is set when registering a type, or later with `integrationTypes.setAuthPolicy` (`auth-policy:write`, admin only, audited as `integration_type.set_auth_policy`); the console asks for confirmation before switching. Creating a type with a policy stays under `systems:write`, because a new type has no systems. In production, choosing `partner+service` while `SERVICE_JWT_SECRET` is not configured is refused with `409 CONFLICT`, so the policy cannot be switched on into a gateway that would turn everyone away.
 
 The token is a JWT, verified in `core/auth/service-token.ts`:
 
@@ -104,6 +104,8 @@ The 503 is fail closed: the policy cannot be met, so nobody gets in, and the cau
 **Accepted risk: replay inside the lifetime.** There is no `jti` store. Tokens are stateless, so a captured token can be replayed until it expires: at most 900 seconds plus the 30 second tolerance. An attacker who replays one still needs a valid partner credential for the same system, because the service token is a second factor and not a replacement. Keep tokens short (the script defaults to 300 seconds) and send them over https only.
 
 **One secret, no overlap.** There is a single `SERVICE_JWT_SECRET` and no previous-key slot, so changing it invalidates every outstanding token at once. Tokens live minutes, so the practical effect is that callers mint a fresh one.
+
+**Known limits (deferred to P5).** Two limits are accepted until phase P5. First, the `sys` claim is optional, so a token minted without `--sys` is valid for every `partner+service` system, not one. Second, there is one global `SERVICE_JWT_SECRET`, with no per-system key and no overlap slot for rotation. Until P5, always mint with `--sys`, and rotate the secret on any suspicion (see "A leaked `SERVICE_JWT_SECRET`" under the threat model below).
 
 ## Deleting and suspending systems
 
@@ -170,18 +172,19 @@ Interchange makes requests to URLs an administrator typed: a system's `baseUrl` 
 4. *Redirects are never followed.* A `3xx` is returned to the caller, and the `rest-outbound` connector treats it as a non-retryable failure.
 5. *Every call is bounded by a timeout:* the system's `timeout_ms` for connectors, 5 seconds for the health check.
 
-**Fixed error codes.** Failures surface as one of six codes with a fixed message. Nothing the upstream said (resolver text, socket errors, TLS details, response bodies) is copied into an error, a job log or a health reason, so callers can log and store them safely.
+**Fixed error codes.** Failures surface as one of seven codes with a fixed message. Nothing the upstream said (resolver text, socket errors, TLS details, response bodies) is copied into an error, a job log or a health reason, so callers can log and store them safely.
 
 | Code | Meaning | `rest-outbound` result |
 |---|---|---|
 | `BLOCKED` | A blocked address or reserved name | `FAILED`, not retried |
 | `INVALID_URL` | Not an absolute URL, scheme not allowed, http in production, no host | `FAILED`, not retried |
-| `DNS` | The host did not resolve | `FAILED`, not retried |
+| `DNS` | The host does not exist or the resolver refused permanently | `FAILED`, not retried |
+| `DNS_TEMPORARY` | A temporary resolver failure, such as `EAI_AGAIN` | `RETRY` with backoff; `DLQ` as "retries exhausted" after the attempt limit |
 | `TIMEOUT` | The timeout elapsed | `RETRY` |
 | `CONNECT` | The connection failed | `RETRY` |
 | `TLS` | Handshake or certificate failure | `RETRY` |
 
-The first three are configuration problems that a retry cannot fix. The last three are treated as transient on the partner side.
+The first three are configuration problems that a retry cannot fix. The last four are treated as transient. The health check does not retry: on a temporary resolver failure it records `DOWN` with the reason `DNS_TEMPORARY`, and the operator presses Check now again.
 
 **Consumers.** The `rest-outbound` connector and the system health check (`systems.checkHealth`, `systems:write`): a `GET` with a 5 second timeout whose body is cancelled unread. A `2xx` stores `UP`; anything else stores `DOWN` with a `health_reason` that is a guard code or `HTTP_<status>`, never an upstream body or message. Any future outbound connector must use `safeFetch` too. A test-only policy override exists so tests can run positive controls against a local server; it is ignored when `NODE_ENV` is `production` and no route can reach it.
 
@@ -198,7 +201,7 @@ The first three are configuration problems that a retry cannot fix. The last thr
 
 Admin access uses `next-auth` with a credentials provider backed by Interchange's own `user` table (`core/auth/options.ts`, `core/auth/login.ts`). Session strategy is JWT with an 8 hour lifetime (session and token `maxAge`); role names, permissions and the user's `token_version` are resolved at login and carried in the token, but nothing authoritative reads them from there.
 
-Authorization is by **permission**, not role name. The catalog is a constant in `core/auth/permissions.ts` (`systems:read`, `systems:write`, `credentials:write`, `credentials:reveal`, `jobs:read`, `jobs:run`, `jobs:retry`, `schedules:read`, `schedules:write`, `audit:read`, `users:read`, `users:write`, `roles:write`, `settings:write`), stored on `role.permissions`, with `*` meaning superadmin. `jobs:run` and `jobs:retry` are in the catalog and granted to `operator`, and the endpoints that check them are `jobs.run` (manual run, `jobs:run`) and `dlq.replay` (DLQ replay, `jobs:retry`).
+Authorization is by **permission**, not role name. The catalog is a constant in `core/auth/permissions.ts` (`systems:read`, `systems:write`, `credentials:write`, `credentials:reveal`, `jobs:read`, `jobs:run`, `jobs:retry`, `schedules:read`, `schedules:write`, `audit:read`, `users:read`, `users:write`, `roles:write`, `settings:write`, `auth-policy:write`), stored on `role.permissions`, with `*` meaning superadmin. No default role lists `auth-policy:write`, so only `admin` (the `*` wildcard) holds it. `jobs:run` and `jobs:retry` are in the catalog and granted to `operator`, and the endpoints that check them are `jobs.run` (manual run, `jobs:run`) and `dlq.replay` (DLQ replay, `jobs:retry`).
 
 The authoritative gate is `requirePermission(perm)` in `core/auth/rbac.ts`, run by `withAdmin` (`core/http/with-admin.ts`) on every `/api/admin/*` request, before any input is parsed: an unauthenticated, disabled or stale-token caller gets 401, and a signed-in caller without the endpoint's permission gets 403. The admin layout does a DB-backed check too (`requireActiveUser()`, redirecting to `/login`), and the client hides navigation entries the user cannot open. Neither trusts the JWT: on every call each re-reads the user's current status, `token_version` and role permissions from the database in one join. A role change, a disabled account, or a `token_version` bump (the mechanism for "log out everywhere") therefore takes effect on the next request, and a token carrying a stale `token_version` is rejected.
 
