@@ -49,11 +49,14 @@ Built and working in the real application:
 - Encrypted credential vault, connector manifest and catalog, Postgres-backed job queue with retry, backoff, a dead-letter queue, stuck-job reclaim, and cron schedules fired exactly once by one signed QStash tick (dormant until an operator arms it).
 - Admin console with working sign-in, permission-based access control (checked against the database on every request, 8 hour sessions, throttled sign-in), and pages for systems, catalog, jobs, schedules and audit.
 - A typed admin API: one `AdminApi` contract, implemented over HTTP (`/api/admin/*`, one catch-all route driven by an endpoint registry, every request through `withAdmin`) and in the browser for the demo, behind a single client UI. One contract test suite runs against both implementations.
-- Manual job run and DLQ replay from the console, gated by the `jobs:run` and `jobs:retry` permissions.
+- Manual job run, DLQ replay and DLQ discard from the console, gated by the `jobs:run`, `jobs:retry` and `jobs:discard` permissions. A replay or discard can carry a note (required for a discard), and only an item still awaiting review can be acted on.
+- Job detail: each job has a page with its metadata, an ordered step timeline with durations, a failure code from a fixed list and its dead-letter history. The payload loads on demand, redacted, and only for roles that hold `logs:payload`; each view is audited.
+- Process log: every scheduled tick, dispatch, drain and retention run is recorded, a duplicate QStash delivery runs nothing, and the Jobs page has a Runs view. Retention (`jobDays`) ages out jobs, step logs and runs under the same kill switch.
+- Audit search: the audit log filters by action, actor, target and date range (kept in the URL), pages by 50, and shows a server-rendered diff built from an allowlist that hides any field it does not recognise.
 - Activity log screen: every inbound and outbound call is recorded with secrets redacted before storage; filters kept in the URL, payloads loaded on demand for roles that hold `logs:payload`, CSV export, cleanup, and an editable retention setting. Test runs of jobs stay out of the live counts unless "Show test runs" is on.
 - CI on every push: typecheck, lint, tests (against an in-memory Postgres) and build.
 
-Planned, not built yet: user and role management screens, DLQ discard and notes screens, alerting, an API playground and generated OpenAPI docs.
+Planned, not built yet: user and role management screens, alerting, an API playground and generated OpenAPI docs.
 
 ## Architecture and security
 
