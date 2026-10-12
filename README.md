@@ -56,7 +56,9 @@ Built and working in the real application:
 - Activity log screen: every inbound and outbound call is recorded with secrets redacted before storage; filters kept in the URL, payloads loaded on demand for roles that hold `logs:payload`, CSV export, cleanup, and an editable retention setting. Test runs of jobs stay out of the live counts unless "Show test runs" is on.
 - CI on every push: typecheck, lint, tests (against an in-memory Postgres) and build.
 
-Planned, not built yet: user and role management screens, alerting, an API playground and generated OpenAPI docs.
+Alerting is built (P3c): seven rules (dead letters, job failure rate, inbound error rate, certificate expiry, system down, stale scheduler tick, stuck jobs) raise deduplicated alerts and per-user notifications, with a System health page and an admin "Evaluate now" action. In this demo the rules run in your browser over the fictional data. Alert messages carry only codes, counts, labels and dates, never payload text.
+
+Planned, not built yet: user and role management screens, an API playground and generated OpenAPI docs.
 
 ## Architecture and security
 
