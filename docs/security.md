@@ -195,7 +195,7 @@ The SFTP host an administrator typed is the second guarded outbound path. It is 
 4. *Redirects are never followed.* A `3xx` is returned to the caller, and the `rest-outbound` connector treats it as a non-retryable failure.
 5. *Every call is bounded by a timeout:* the system's `timeout_ms` for connectors, 5 seconds for the health check.
 
-**Fixed error codes.** Failures surface as one of seven codes with a fixed message. Nothing the upstream said (resolver text, socket errors, TLS details, response bodies) is copied into an error, a job log or a health reason, so callers can log and store them safely.
+**Fixed error codes.** The guard fails with one of seven codes and a fixed message, and that set stays closed. No upstream text from the network layer (resolver text, socket errors, TLS details) is copied into an error, a job log or a health reason, so callers can log and store them safely. An HTTP answer is different: the guard returned a response, so a 4xx or 5xx body is kept, but only clipped, masked and stored in `job.upstream_error`, never in an error message, a step log, an activity row or a health reason (see "The partner's error text" below).
 
 | Code | Meaning | `rest-outbound` result |
 |---|---|---|
@@ -206,8 +206,18 @@ The SFTP host an administrator typed is the second guarded outbound path. It is 
 | `TIMEOUT` | The timeout elapsed | `RETRY` |
 | `CONNECT` | The connection failed | `RETRY` |
 | `TLS` | Handshake or certificate failure | `RETRY` |
+| HTTP `429` (`HTTP_429`, not a guard code) | The partner asks for a slower pace | `RETRY`, no sooner than its `Retry-After` (clamped to 1 hour) |
+| HTTP other `4xx` (`HTTP_4XX`) and `3xx` (`REDIRECT`) | The partner's answer, or a refused redirect | `FAILED`, not retried |
+| HTTP `5xx` (`HTTP_5XX`) | Transient on the partner side | `RETRY` |
 
-The first three are configuration problems that a retry cannot fix. The last four are treated as transient. The health check does not retry: on a temporary resolver failure it records `DOWN` with the reason `DNS_TEMPORARY`, and the operator presses Check now again.
+The first three guard codes are configuration problems that a retry cannot fix. The other four are treated as transient, and so are a 429 and a 5xx. Retries use a capped (15 minutes), jittered backoff. The health check does not retry: on a temporary resolver failure it records `DOWN` with the reason `DNS_TEMPORARY`, and the operator presses Check now again.
+
+**The partner's error text.** When a call gets a 4xx or 5xx answer, `outboundRequest` (`core/net/outbound-client.ts`) reads at most a clipped prefix of the body (the read stops and the stream is cancelled, and a stalled read is stored as `[body read aborted]`). The drain then stores it in `job.upstream_error` and nowhere else:
+
+- *Masked and capped.* The text first goes through `maskKnown`, which replaces every decrypted credential value of the system in its raw, JSON-escaped and URL-encoded forms (values under 8 characters are skipped, because masking a short value would shred the text, and each U+0000 becomes U+FFFD). Then the pattern redaction runs (`redactText`) with a body budget of 7968 characters, so the stored text, including the clip marker, never exceeds the 8000-character cap (`MAX_UPSTREAM_ERROR_CHARS`, also a CHECK constraint on the column).
+- *Read only through the payload view.* `job.upstream_error` is returned only by `jobs.payload` (`GET /jobs/:id/payload`), which needs `jobs:read` and `logs:payload` and writes the strict audit row `job.payload_view`. It is never in a list, in `jobs.get`, in the DLQ list, in an activity row, in a step log, in an alert or notification, or in an inbound response.
+- *Replaced per attempt.* Each failed attempt overwrites it (null when the attempt carried none), a success clears it, and a reclaim leaves it as it was.
+- *Limit of the control.* The mask knows the credentials we sent. Partner-controlled text can still hold a secret we never sent (a token of the partner's own, or another customer's data), and pattern redaction is best effort. That is why the field sits behind `logs:payload` and an audit row, not behind a claim that it is clean.
 
 **Consumers.** The `rest-outbound` connector and the system health check (`systems.checkHealth`, `systems:write`): a `GET` with a 5 second timeout whose body is cancelled unread. A `2xx` stores `UP`; anything else stores `DOWN` with a `health_reason` that is a guard code or `HTTP_<status>`, never an upstream body or message. Any future outbound connector must use `safeFetch` too. Every one of these calls now writes an outbound `activity_log` row: `safeFetch` and `probeSftp` take a required `log` context, and the QStash calls go through `qstashFetch`. The row holds the origin and masked path, the method, the status code (0 when no response arrived, with a fixed error code in the payload) and the timing, never a request header; the audit script (`scripts/audit-log-calls.ts`) fails CI for a network call that skips the wrappers. See "Activity log privacy (P3a)". A test-only policy override exists so tests can run positive controls against a local server; it is ignored when `NODE_ENV` is `production` and no route can reach it.
 
@@ -382,7 +392,7 @@ Every privileged admin mutation writes a row to `admin_audit_log` via `auditLog(
 The provisioned-dormant default is described in `docs/architecture.md` as a cost-control property; it is equally a security property:
 
 - A freshly deployed Interchange instance, even one seeded with real connector types and even one where an operator has (prematurely, or by mistake) issued API keys for a partner system, **rejects all inbound traffic for that system** until an operator explicitly sets `status = 'ACTIVE'`. There is no state between "provisioned" and "live" where a half-configured system quietly accepts requests.
-- No outbound schedule fires and no drain runs on a timer until QStash is explicitly armed (`QSTASH_TOKEN` set and the platform tick armed from the Schedules page; arming a single schedule registers nothing with QStash; the job endpoints additionally require signed requests). A deploy with a misconfigured or forgotten schedule does not leak outbound traffic; it does nothing.
+- No outbound schedule fires and no tick runs on a timer until QStash is explicitly armed (`QSTASH_TOKEN` set and the platform tick armed from the Schedules page; arming a single schedule registers nothing with QStash; the job endpoints additionally require signed requests). Dormant means no timer tick: a throttled after-response drain (60 s window, 3 jobs, 15 s claim budget) runs on console reads and inbound calls and processes only jobs that are already queued and due. A deploy with a misconfigured or forgotten schedule does not leak outbound traffic; with an empty queue it does nothing.
 - Leaving the live state also stops a system's background work. A `SUSPENDED` or `SETUP` system fires no schedules and has its queued jobs held, and a deleted system's queued jobs fail; nothing catches up when it is activated or restored (see "Deleting and suspending systems").
 - This means the platform's default failure mode, for both a fresh deploy and a partially configured one, is silence rather than partial exposure.
 
