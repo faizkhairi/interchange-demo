@@ -329,6 +329,13 @@ Failed sign-ins write an `auth.login_failed` row to `admin_audit_log` (the attem
 
 Reading the queue (`dashboard.queue`, the Queue page, P4d) needs both `systems:read` and `jobs:read`, because the page shows system rows next to job counts; a role with only one of them gets 403 on the call and sees no Queue entry. It adds no permission id.
 
+**Menu layout (P5d).** The sidebar layout is one shared setting, so its permissions are worth stating exactly (`core/pure/nav-layout.ts`, `core/services/nav.ts`, `src/admin-api/endpoints/nav.ts`).
+
+- **`nav.get` is open to any signed-in session**, because every role draws the sidebar. Its order and hidden list are not filtered by permission and carry no data: they are menu slugs from a fixed list (`src/admin-api/nav-slugs.ts`).
+- **Pinned systems need `systems:read`.** A pinned system is a system name, so `nav.get` and the response of `nav.save` return pins only to a caller that holds `systems:read`. A caller without it keeps the stored pins on save and on reset, and a save that sends pins is refused (`VALIDATION`, issue code `forbidden`). A pin must be a live system (`not_found` otherwise), and at most 10 are allowed.
+- **Hiding is not an access control.** The layout is applied in the sidebar after the permission filter, so it cannot show an entry a role cannot open. A hidden entry is still reachable by URL, and the API behind it still answers a holder of the permission. The Menu entry itself cannot be hidden.
+- **`nav.save` needs `settings:write`** (admin only by default) and is audited as `nav.save` with counts and group names only: the diff keys `hiddenCount`, `pinnedCount` and `orderedGroups` are on the allowlist in `core/pure/audit-diff.ts`, and the row never holds a system name or id.
+
 Client-side route redirects and hidden UI elements are UX conveniences only. `requirePermission()` running server-side is the real gate; it is never bypassed by disabling JavaScript or calling `/api/admin/*` directly. The admin surface is the typed `/api/admin/*` HTTP API: one catch-all route (`src/app/api/admin/[...path]/route.ts`) driven by an endpoint registry, with every request wrapped in `withAdmin`. In order, `withAdmin`:
 
 1. assigns a request id (an inbound `X-Request-ID` is kept only when it is short and made of safe characters; the edge proxy resolves it first and `withAdmin` reuses it; the id is echoed on every response);
