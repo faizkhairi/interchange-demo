@@ -1,6 +1,6 @@
 # Security
 
-Last updated: 2026-11-15
+Last updated: 2026-11-16
 
 This document describes Interchange's security posture: how credentials are protected at rest, how inbound partner requests are authenticated and confined, how outbound requests are kept away from internal networks, how admin access is controlled, why the dormant-by-default posture is itself a security property, and what an attacker can and cannot do if a partner credential is compromised.
 
@@ -15,7 +15,7 @@ Credentials Interchange holds on behalf of a project, to call *out* to a partner
 - A fresh, random 12-byte IV is generated per value and never reused under the same key.
 - The master key is a 64-hex-character (32-byte) value read from the `CREDENTIAL_MASTER_KEY` environment variable. It is never sent to the client and never stored in the database.
 - Each stored blob is `{ iv, ciphertext, authTag, keyVersion }`. The `authTag` means any tampering with the ciphertext is detected on decrypt, not silently accepted.
-- `keyVersion` supports key rotation: `CREDENTIAL_MASTER_KEY_PREVIOUS` can hold the prior key during a rotation window, so old blobs keep decrypting while new writes use the current key.
+- `keyVersion` selects the master key a blob is read with: version 1 is `CREDENTIAL_MASTER_KEY` (all new writes), version 0 is `CREDENTIAL_MASTER_KEY_PREVIOUS`. There is no fallback between them and nothing re-encrypts existing rows, so a rotation needs the secrets re-entered; see the operations runbook, section 3 (in the source repository).
 - The same master key also protects queued async inbound payloads, through a separate purpose key (see "Async inbound payloads: the payload vault" below). No new key or environment variable is added.
 
 These blobs live in `system_credential`, `type_credential` (the default credentials of an integration type), `storage_config`, `sftp_config` (the SFTP password or private key, `enc_secret_*`) and `system_certificate` (an optional certificate private key, `enc_key_*`) and `oauth_token_cache` (the access token fetched for an OAuth 2.0 client credential, see "OAuth 2.0 client credentials" below); see `db/schema/config-auth.ts`. Each has its own `enc_*` column set following the same shape. One more table, `job_payload_vault` (`db/schema/operational.ts`), holds the executable copy of a queued async inbound payload with the same blob shape, but it is encrypted under a purpose key derived from the master key, not under the master key itself. `system_service_key` (`db/schema/config-auth.ts`) does the same for per-system service keys, under its own purpose key (`service-key`), with the key's id as the additional authenticated data.
@@ -46,7 +46,7 @@ When a partner asks for 202 Accepted (`Prefer: respond-async`, see `docs/archite
 - **Lifetime.** 24 hours. A copy is deleted when the job succeeds, when its dead letter is discarded, when the job dead-letters because its copy is missing or expired (any other dead letter keeps it until its TTL for a DLQ replay), when it expires (the tick, the throttled retention run and the after-response drain window purge expired rows, whatever the retention kill switch says) and by cascade when the job is deleted.
 - **Fails closed.** A missing, expired or undecryptable copy fails the job with the non-retryable `PAYLOAD_UNAVAILABLE`, and `execute()` is not called. A replay of such a dead letter is refused with 409 "the payload is no longer held" (existence and expiry only, never a decrypt), so it cannot open a second dead letter. A seal failure when the request arrives is logged without the payload and the call runs inline.
 - **What the connector sees.** `{ flags }` only, never outbound credentials, and the payload's secret values are masked out of the stored result, errors and log lines, as for an inline call.
-- **Rotation.** The previous master key must stay available for the lifetime of the queued copies: keep `CREDENTIAL_MASTER_KEY_PREVIOUS` set for at least 24 hours after a rotation (`docs/deployment.md`). A copy whose key is gone is unreadable and ends as `PAYLOAD_UNAVAILABLE`, but the ciphertext is kept until its TTL, so restoring the previous key and replaying the dead letter still runs it. Expired rows are purged by the tick and by the throttled retention run; a row past its TTL that has not been purged yet is never opened.
+- **Rotation.** A queued copy is stamped with the key version it was sealed under (1, the current key), so after a master key swap it is read with the new key and is unreadable (the operations runbook, section 3 (in the source repository)). A copy whose key is gone is unreadable and ends as `PAYLOAD_UNAVAILABLE`, but the ciphertext is kept until its TTL, so restoring the previous key and replaying the dead letter still runs it. Expired rows are purged by the tick and by the throttled retention run; a row past its TTL that has not been purged yet is never opened.
 
 ### Outbound auth injection and the origin pin
 
@@ -90,31 +90,13 @@ Admin login passwords (the `user` table) are hashed with bcrypt (`bcryptjs`, pur
 
 ## Inbound authentication and cross-system confinement
 
-Every call into `/api/inbound/<systemCode>/<endpoint>` first passes the per-IP rate limit, then `authenticatePartner()` in `core/auth/with-partner-auth.ts`, before any connector code runs:
+Every call into `/api/inbound/<systemCode>/<endpoint>` first passes the per-IP rate limit, then `authenticatePartner()` in `core/auth/with-partner-auth.ts`, before any connector code runs. The system named in the URL is resolved first (a deleted system is an unknown system), a system that is not `ACTIVE` rejects all traffic (the dormant posture applied at the auth layer, see below), and the credential is found by an index and verified in constant time. The service token, the per-system and per-endpoint limits and the connector's input checks follow, in that order. The full order, the credential kinds and the exact responses are in [caller-auth.md](caller-auth.md).
 
-1. **Extract the credential** from `x-api-key`, or an `Authorization: Bearer <token>` or `Authorization: Basic <base64>` header.
-2. **Resolve the system named in the URL first.** The `systemCode` path segment is looked up in `external_system` before the credential is checked against anything. Soft-deleted systems are excluded from that lookup, so a deleted system is an unknown system (see "Deleting and suspending systems" below).
-3. **Reject if the system is not `ACTIVE`.** A system in `SETUP` or `SUSPENDED` rejects all traffic, even if a valid credential exists for it. This is the dormant posture applied at the auth layer, not just at deploy time (see below).
-4. **Find the credential, then verify it in constant time.** An API key or bearer token is located by its `lookup_hash` (`system_api_key` or `system_bearer_token`) across all systems; a Basic credential is located by its keyed `username_lookup` (`system_basic_auth`). The salted hash is then verified with the constant-time comparison described above. A row that belongs to the URL's system is rejected with 401 if it is revoked or expired, and otherwise accepted, which stamps `last_used_at` on that credential. A live row that belongs to a different system is refused with 403 (see "Cross-system confinement" below). For Basic, the username and password comparisons both always run and are then combined, so timing does not reveal which half was wrong. A key or token that predates migration `0002` has no `lookup_hash` yet and is checked by a fallback scoped to the URL's own system.
-5. **Check the service token** when the system's integration type requires one (see "Service token" below). It runs after the partner credential, so a stranger learns nothing about the requirement.
-6. **Apply the per-system rate limit** (`external_system.rate_limit_rpm`) only after authentication succeeds.
-7. **Check the endpoint name and apply the endpoint limit**, if the system declares any (see "Endpoint names and limits" below).
-8. **Run the connector's input checks.** Resolve the handler, read `Idempotency-Key`, parse the JSON body, validate it strictly (see "Strict payloads" below) and only then create the job.
-
-### Failure responses
-
-Every pre-auth failure (missing credential, unknown or deleted system, inactive system, wrong secret, revoked or expired credential, a credential whose owning system is deleted) returns the same `401 {"error":"unauthorized"}`, so a caller cannot probe which system codes exist, which are active, or whether a credential was once valid. The other authentication outcomes are the confinement `403 {"error":"forbidden"}` described next and the service-token responses described under "Service token". The real reason is recorded only in `activity_log`. Unknown and inactive systems also spend one hash computation so timing matches a wrong secret.
+Every pre-auth failure returns the same `401 {"error":"unauthorized"}`, so a caller cannot probe which system codes exist, which are active, or whether a credential was once valid. The real reason is recorded only in `activity_log`, and unknown and inactive systems spend one hash computation so timing matches a wrong secret. See [caller-auth.md](caller-auth.md#what-a-caller-sees-on-failure).
 
 ### Cross-system confinement
 
-**A credential for Partner A never authenticates a request to Partner B's routes.** The gateway resolves the URL's system first, then identifies the presented credential by its lookup index across all systems. A real credential presented on the wrong route is therefore recognised and refused, instead of being treated as unknown:
-
-- The refusal is `403` only when a *live* credential proves its identity (its salted hash verifies) but belongs to a different system than the URL names. The response body is the generic `{"error":"forbidden"}`. The owning system's code is written only to the activity row (`ownerSystemCode`, with the reason `credential belongs to another system`) and never appears in a response.
-- A revoked or expired credential presented on another system is a plain `401`, indistinguishable from a wrong secret.
-- A credential whose owning system is soft-deleted counts as no row at all, for API keys, bearer tokens and Basic alike. Presented on another system's route it gets `401`, never `403`: a `403` would tell the holder of a stale credential that it was once real.
-- For Basic, `403` needs both the username and the password to match a live row of another system. A username match alone never yields `403`, so the status is no oracle for which usernames exist.
-- A key or token issued before migration `0002` has no `lookup_hash` until it is first used. It is checked only against the URL's own system, so on another system it is `401`, not `403`, until a successful use on its own system backfills the index.
-- Because a `403` requires a verified secret, it tells nothing to a caller who does not already hold a valid credential. To a holder of a live key it does confirm that the system code in the URL exists; this is accepted by design, since that caller already holds a credential for this platform.
+**A credential for Partner A never authenticates a request to Partner B's routes.** The gateway resolves the URL's system first, then identifies the presented credential by its lookup index across all systems, so a real credential on the wrong route is recognised and refused instead of being treated as unknown. The refusal is `403 {"error":"forbidden"}` only when a *live* credential proves its identity but belongs to a different system; the owning system's code goes to the activity row only. A revoked, expired or deleted-owner credential on another system is a plain `401`, and for Basic a `403` needs both the username and the password to match. Because a `403` requires a verified secret, it tells nothing to a caller who does not already hold a valid credential. The rules and their sources are in [caller-auth.md](caller-auth.md#cross-system-confinement).
 
 ### Lookup indexes and the master-key rotation window
 
@@ -125,51 +107,11 @@ Every pre-auth failure (missing credential, unknown or deleted system, inactive 
 
 ## Service token
 
-Some partners are called by a backend job rather than a person, and a project may want a second, short-lived proof on top of the partner's long-lived key. Each integration type carries an `auth_policy`:
-
-| Policy | Meaning |
-|---|---|
-| `partner` (default) | The partner credential alone authenticates the call. |
-| `partner+service` | The partner credential must pass first, and the request must also carry a valid service token in the `X-Service-Token` header. |
-
-The policy belongs to the type, so every system of that type follows it. It is set when registering a type, or later with `integrationTypes.setAuthPolicy` (`auth-policy:write`, admin only, audited as `integration_type.set_auth_policy`); the console asks for confirmation before switching. Creating a type with a policy stays under `systems:write`, because a new type has no systems. Switching a type to `partner+service` needs no environment value. What it does need is a service key on each of its systems: a system with no usable key answers every call with `401`, so issue the keys before setting such a system `ACTIVE`.
+Each integration type carries an `auth_policy`: `partner` (default, the partner credential alone authenticates the call) or `partner+service` (the partner credential must pass first, and the request must also carry a valid service token in the `X-Service-Token` header). The policy belongs to the type, so every system of that type follows it. It is set when registering a type, or later with `integrationTypes.setAuthPolicy` (`auth-policy:write`, admin only, audited as `integration_type.set_auth_policy`); the console asks for confirmation before switching, and creating a type with a policy stays under `systems:write`, because a new type has no systems. A system with no usable service key answers every call with `401`, so issue the keys before setting such a system `ACTIVE`. The token rules and responses are in [caller-auth.md](caller-auth.md#service-tokens-per-system-service-keys).
 
 ### Service keys
 
-Each system of a `partner+service` type has its own service keys, in the table `system_service_key` (`db/schema/config-auth.ts`, migration `0014`). A key signs tokens for that one system and no other. The row's uuid is the `kid` that the token's protected header must carry.
-
-- **Issue.** On the system's Credentials tab, "Issue service key" (shown only for a system of an inbound `partner+service` type, to a user with `credentials:write`), or `POST /api/admin/systems/:id/service-keys` (`credentials:write`, audited as `service_key.issue`). The body takes an optional `label` and an optional `expiresInDays`. The answer is `{kid, plaintext}`. A system whose type is not an inbound `partner+service` type is refused with `409` "this system's type does not use service tokens" (an outbound type never takes a key), and a deleted system with `409` "system is deleted".
-- **The key.** The server generates 32 random bytes. Their base64url text (43 characters) is the `plaintext`, shown once. It is stored encrypted, never hashed, under a purpose key derived from `CREDENTIAL_MASTER_KEY` (purpose `service-key`), with the key's id as the additional authenticated data, so a row copied onto another id fails its tag check. There is no reveal: `credentials.reveal` reads only the outbound credential table, so a service key id is `404` there, and a lost key is rotated.
-- **Rotate and revoke.** A service key is a credential of kind `service`: it appears in `credentials.list`, `credentials.rotate`, `credentials.revoke` and `credentials.expiring` (and so in the Dashboard's expiring count) like the other inbound kinds. Rotate returns a newly generated key, whose id is the new `kid`. The previous key stays valid for the grace window you choose (0 to 1440 minutes, default 0), which is the previous-key slot: callers switch over while both work. Revoke ends a key at once, and it also ends the older keys of its rotation chain that are still inside their grace window, as for the other kinds.
-- **Policy switch.** Switching a type from `partner+service` to `partner` leaves its systems' service keys in place but unused. Switching back makes every unrevoked, unexpired key valid again. Revoke what should end: the Credentials tab keeps listing the keys.
-
-The token is a JWT, verified in `core/auth/service-token.ts`:
-
-- **Header.** `alg` must be exactly `HS256` (`none`, HS512, RS256 and every other algorithm are refused) and `kid` must be a uuid. The header is read before any verification, and only to pick the key row.
-- **Key lookup.** The key is selected by `kid` AND the system named in the URL AND `revoked_at` is null AND the key has not reached `expires_at`. A `kid` that is unknown, belongs to another system, is revoked or is past its grace end gives the same answer. There is no cache: the row is read on every call, so a revoke, or the end of a grace window, takes effect on the next call on every instance. A key that fails to decrypt (a master key that does not match, a tampered row) is a `401`, never a `500`.
-- **Claims.** `aud` must be `interchange-inbound`. `sub`, `iat`, `exp` and `sys` are all required.
-- **Lifetime.** `exp - iat` is at most 900 seconds, and a token issued in the future beyond the tolerance is refused. Clock tolerance is 30 seconds.
-- **Scope.** `sys` must equal the system code in the URL, else `403`. The check runs after the signature has verified, so a token signed with this system's own key but naming another system gets the `403`.
-
-What the caller sees, always after the partner credential has passed:
-
-| Situation | Response | Activity reason (never in the response) |
-|---|---|---|
-| Header missing | `401 {"error":"unauthorized"}` | missing service token |
-| Wrong algorithm, no or non-uuid `kid`, bad signature, wrong audience, missing claim (including `sys`), `iat` in the future | `401 {"error":"unauthorized"}` | invalid service token |
-| `kid` unknown, of another system, revoked or past its grace end | `401 {"error":"unauthorized"}` | unknown service key |
-| Key row cannot be decrypted | `401 {"error":"unauthorized"}` | service key unreadable |
-| Expired | `401 {"error":"unauthorized"}` | service token expired |
-| Lifetime over 900 s | `401 {"error":"unauthorized"}` | service token lifetime too long |
-| `sys` names another system | `403 {"error":"forbidden"}` | service token for another system |
-
-A system of a `partner+service` type with no usable key fails closed: no token verifies, so every call is a `401` (there is no "not configured" answer any more). Claims are never echoed in a response or a reason. On success the activity row's `authMethod` is the partner method with `+service` appended.
-
-**A service token is never accepted as a partner credential.** It proves nothing on its own. A Bearer value that matches no partner credential, looks like a JWT and carries a uuid `kid` is checked against that URL system's own service keys only (the `kid` is looked up among that system's usable keys, never another system's). If the signature verifies, with claims ignored so an expired or other-system-claim token counts too, the request is refused with `401` and the activity reason "service token presented as partner credential". The response is the same generic `401`, never `403`, and the check runs only after the credential lookup has missed. A key that is missing or cannot be decrypted gives no special reason, only the plain one. It exists to make a misconfigured client visible in the log; it does not create a path that authenticates. A service key sent as `X-API-Key` or as a Bearer partner credential is likewise just a `401`.
-
-**Minting.** `SERVICE_KEY=<plaintext> npm run mint:service-token -- --kid <kid> --sub worker-1 --sys ACME-ERP --ttl 300` prints only the token. `--kid` (the key id the issue call returned), `--sys` (the system code) and `--sub` are required; `--ttl` is 1 to 900 seconds (default 300). `SERVICE_KEY` is a shell variable of the person running the script, not an application or deployment environment key, and it is read from the environment rather than an argument so it stays out of shell history and process listings. Failures go to stderr and never echo the key.
-
-**Accepted risk: replay inside the lifetime.** There is no `jti` store. Tokens are stateless, so a captured token can be replayed until it expires: at most 900 seconds plus the 30 second tolerance. An attacker who replays one still needs a valid partner credential for the same system, because the service token is a second factor and not a replacement. Keep tokens short (the script defaults to 300 seconds) and send them over https only.
+Each system of a `partner+service` type has its own service keys, in the table `system_service_key` (`db/schema/config-auth.ts`, migration `0014`). A key signs tokens for that one system and no other. The server generates 32 random bytes, shows their base64url text once, and stores it encrypted (never hashed) under a purpose key derived from `CREDENTIAL_MASTER_KEY` (purpose `service-key`), with the key's id as the additional authenticated data, so a row copied onto another id fails its tag check. There is no reveal: a lost key is rotated. A service token is never accepted as a partner credential, and a replay inside its lifetime is an accepted risk because there is no `jti` store. The token rules, the response table, issue, rotate and revoke, and the mint script are in [caller-auth.md](caller-auth.md#service-tokens-per-system-service-keys).
 
 ## Deleting and suspending systems
 
@@ -376,7 +318,7 @@ Every `/api/admin/*` response carries `Cache-Control: no-store`, because one of 
 
 ## Admin rate limit
 
-`/api/admin/*` is limited per minute, in one-minute fixed windows, by the same Postgres-backed limiter the gateway uses (`rate_limit_bucket`):
+`/api/admin/*` is limited per minute, in one-minute fixed windows, by the same Postgres-backed limiter the gateway uses (`rate_limit_bucket`). The admin limits below are two of the limiters the platform runs; the others (sign-in, profile, credential reveal, the playground and the storage and SFTP connection tests) are listed with their keys, defaults and sources in [rate-limiting.md](rate-limiting.md).
 
 | Limit | Bucket | Default | Override | Checked |
 |---|---|---|---|---|
@@ -453,7 +395,7 @@ CORS is **denied by default**, in every environment, and two rules apply dependi
 
 ## Rate limiting and activity logging
 
-Inbound traffic is limited per client IP (taken from `x-vercel-forwarded-for`, then `x-real-ip`, then the first `x-forwarded-for` entry, validated as an IP address, else `unknown`) (`RATE_LIMIT_IP_RPM`, default 250 per minute) per system (`external_system.rate_limit_rpm`) and, for a system that declares endpoint limits, per endpoint (see "Endpoint names and limits"), using one atomic upsert per bucket per request against `rate_limit_bucket`. A rejected call returns 429 with `Retry-After`. The limiter fails open if the database is unreachable (a logged warning), trading brief over-admission for availability. Every inbound outcome, including 401, 429 and validation failures, writes an `activity_log` row with the request id, status, timing and both payloads, redacted before storage (see "Activity log privacy (P3a)"). Outbound calls write a row too. Rows older than the retention setting (default 30 days) are pruned, and credentials or `Authorization` headers are never stored. A 422 caused by unknown payload keys stores the key names only, never the values.
+Inbound traffic is limited per client IP (taken from `x-vercel-forwarded-for`, then `x-real-ip`, then the first `x-forwarded-for` entry, validated as an IP address, else `unknown`) (`RATE_LIMIT_IP_RPM`, default 250 per minute) per system (`external_system.rate_limit_rpm`) and, for a system that declares endpoint limits, per endpoint (see "Endpoint names and limits"), using one atomic upsert per bucket per request against `rate_limit_bucket`. A rejected call returns 429 with `Retry-After`. The limiter fails open if the database is unreachable (a logged warning), trading brief over-admission for availability. Every inbound outcome, including 401, 429 and validation failures, writes an `activity_log` row with the request id, status, timing and both payloads, redacted before storage (see "Activity log privacy (P3a)"). Outbound calls write a row too. Rows older than the retention setting (default 30 days) are pruned, and credentials or `Authorization` headers are never stored. A 422 caused by unknown payload keys stores the key names only, never the values. Every limiter, its key, default and source, and the known limits of the fixed window, are in [rate-limiting.md](rate-limiting.md).
 
 ### Rate-limit monitor
 
