@@ -1,6 +1,6 @@
 # Rate limiting
 
-Last updated: 2026-11-16
+Last updated: 2026-11-17
 
 Interchange has more than one limiter. They all call the same function, `consumeRateLimit` (`core/gateway/rate-limit.ts:64`), which counts requests per key in one-minute fixed windows in the `rate_limit_bucket` table, unless a caller passes a longer window. This document lists every limiter, its key, its default and where it lives, then explains what a rejected caller sees and the limits of the mechanism. For the security reasoning behind the inbound and admin limits, see [security.md](security.md).
 
@@ -27,6 +27,7 @@ Interchange has more than one limiter. They all call the same function, `consume
 | Storage Test, per system | `admin:storage-test:sys:<system id>` | 10 per minute | `core/services/storage.ts:62`, `core/services/storage.ts:378-382` |
 | SFTP Test, per user | `admin:sftp-test:<user id>` | 5 per minute | `core/services/sftp.ts:37`, `core/services/sftp.ts:39`, `core/services/sftp.ts:219-223` |
 | SFTP Test, per system | `admin:sftp-test:sys:<system id>` | 10 per minute | `core/services/sftp.ts:38`, `core/services/sftp.ts:230-234` |
+| Alert delivery Test, per user | `admin:alert-test:<user id>` | 5 per minute (`ALERT_TEST_USER_LIMIT`, `ALERT_TEST_WINDOW_MS`) | `core/services/alert-delivery.ts:31-32`, `core/services/alert-delivery.ts:107` |
 
 Notes on the table:
 
@@ -35,6 +36,7 @@ Notes on the table:
 - **Reveal is spent before the lookup.** A disabled reveal flag spends nothing, but once reveal is on, the budget is spent before the credential is looked up, so probing ids costs budget (`core/services/credentials.ts:816-823`).
 - **Playground order.** The user bucket and then the system bucket are spent before the deleted, status and direction checks, so a refused call still costs budget (`core/services/playground.ts:206-214`).
 - **Keys are bounded.** A key is cut to 200 characters before it is stored (`core/gateway/rate-limit.ts:18`, `core/gateway/rate-limit.ts:71`).
+- **Alert delivery Test spends first.** The per-user bucket is spent before the stored setting is read, so a call with no URL set still costs budget (`core/services/alert-delivery.ts:107-112`). Delivery of real alerts is not rate limited: it is bounded by the 30 minute throttle, one POST per evaluation and 20 items per POST (see [alerting.md](alerting.md)).
 - **Several limiters can apply to one request.** The admin per-IP and per-user limits sit on top of every limit below them in the admin rows (`core/http/with-admin.ts:150`, `core/http/with-admin.ts:165`).
 
 ## What a rejected caller sees
@@ -46,7 +48,7 @@ The shape depends on the surface.
 | Inbound (`/api/inbound/*`) | `429 {"error":"rate limit exceeded"}` | `Retry-After`, `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`, plus `X-Request-ID` and `Vary: Origin` | `src/app/api/inbound/[systemCode]/[endpoint]/route.ts:268`, `route.ts:201-207`, `core/gateway/rate-limit.ts:101-110` |
 | Inbound `OPTIONS` preflight | `429` with no body | Same four rate-limit headers, plus `X-Request-ID` and `Vary: Origin` | `src/app/api/inbound/[systemCode]/[endpoint]/route.ts:104-109` |
 | Admin API, per-IP or per-user limiter | Error envelope with code `RATE_LIMITED` and message "too many requests" | `Retry-After`, `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset` | `core/http/with-admin.ts:138-140`, `core/gateway/rate-limit.ts:101-110` |
-| Admin API, limiter inside a service (reveal, profile, change password, playground, Storage Test, SFTP Test) | Error envelope with code `RATE_LIMITED` and a fixed message | `Retry-After` only, no `X-RateLimit-*` | `core/http/with-admin.ts:186-192`, for example `core/services/credentials.ts:824-826` |
+| Admin API, limiter inside a service (reveal, profile, change password, playground, Storage Test, SFTP Test, Alert delivery Test) | Error envelope with code `RATE_LIMITED` and a fixed message | `Retry-After` only, no `X-RateLimit-*` | `core/http/with-admin.ts:186-192`, for example `core/services/credentials.ts:824-826` |
 | Login (per IP or per email) | No 429: the caller gets the same failure as a wrong password | None | `core/auth/login.ts:65-76` |
 
 `Retry-After` is the whole number of seconds until the current window ends, never less than 1 (`core/gateway/rate-limit.ts:74`). `X-RateLimit-Reset` is the epoch second when the window ends (`core/gateway/rate-limit.ts:73`). `Retry-After` is added only when the request was refused (`core/gateway/rate-limit.ts:108`), while the `X-RateLimit-*` set is also sent on an inbound response that was admitted. On an admitted inbound call the headers report the tightest bucket the request consumed (`src/app/api/inbound/[systemCode]/[endpoint]/route.ts:312-319`). The admin API sends the `X-RateLimit-*` headers only on a 429 raised by the per-IP or per-user limiter (`core/http/with-admin.ts:138-140`).
