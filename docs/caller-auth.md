@@ -22,7 +22,7 @@ The route handler documents its own order in a header comment (`src/app/api/inbo
 | 0 | The per-IP rate limit is spent, before any credential work | `429` | `src/app/api/inbound/[systemCode]/[endpoint]/route.ts:263-269` |
 | 1a | Extract the credential from `x-api-key`, then from `Authorization: Bearer ...` or `Authorization: Basic ...` | `401`, reason "missing credential" | `core/auth/with-partner-auth.ts:75-85`, `core/auth/with-partner-auth.ts:334-335` |
 | 1b | Resolve the system named in the URL, excluding soft-deleted systems, and join its integration type | `401`, reason "unknown system" | `core/auth/with-partner-auth.ts:341-352` |
-| 1c | Require the system to be `ACTIVE` | `401`, reason "system not active" | `core/auth/with-partner-auth.ts:354-358` |
+| 1c | Require the system to be `ACTIVE` | `401`, reason "system not active (status <status>)" | `core/auth/with-partner-auth.ts:354-358` |
 | 1d | Find the credential row, then verify it with a constant-time comparison | `401` (wrong, revoked, expired) or `403` (a live credential of another system) | `core/auth/with-partner-auth.ts:197-254`, `core/auth/with-partner-auth.ts:256-326`, `core/auth/with-partner-auth.ts:374-376` |
 | 2 | If the type's policy is `partner+service`, require and verify `X-Service-Token` | `401` or `403` | `src/app/api/inbound/[systemCode]/[endpoint]/route.ts:295-310` |
 | 3 | The per-system rate limit, then the endpoint check and per-endpoint limit | `429` or `404` | `src/app/api/inbound/[systemCode]/[endpoint]/route.ts:321-363` |
@@ -129,7 +129,7 @@ Every unauthenticated outcome returns the same body, so a caller cannot tell a m
 |---|---|---|
 | No credential | `401 {"error":"unauthorized"}` | missing credential |
 | Unknown or deleted system | `401` | unknown system |
-| System not `ACTIVE` | `401` | system not active |
+| System not `ACTIVE` | `401` | system not active (status `<status>`) |
 | Wrong secret, unknown credential | `401` | invalid credential |
 | Revoked or expired credential of this system | `401` | credential revoked, credential expired |
 | Live credential of another system | `403 {"error":"forbidden"}` | credential belongs to another system |

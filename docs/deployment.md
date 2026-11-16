@@ -61,11 +61,11 @@ It prints only the token, to be sent as `X-Service-Token` next to the partner cr
 3. Vercel runs `npm run build`, which is wired to `prebuild` in `package.json`:
 
    ```
-   "prebuild": "npm run generate:connectors",
+   "prebuild": "npm run generate:connectors && npm run generate:openapi",
    "build": "next build",
    ```
 
-   This means every deploy regenerates `src/connectors/generated/manifest.ts` and `src/connectors/generated/catalog.ts` (each connector's JSON Schema and sample) from whatever connector folders exist in the repository at that commit, before Next.js builds. The build fails if a connector's `sample` does not pass its input schema. You do not need a separate manual step to keep them in sync; committing a new connector folder and pushing is enough, though committing the generated files too (as the repository does) keeps them visible in code review.
+   This means every deploy regenerates `src/connectors/generated/manifest.ts` and `src/connectors/generated/catalog.ts` (each connector's JSON Schema and sample) from whatever connector folders exist in the repository at that commit, then `src/generated/openapi.json` from the catalog, before Next.js builds. The build fails if a connector's `sample` does not pass its input schema. You do not need a separate manual step to keep them in sync; committing a new connector folder and pushing is enough, though committing the generated files too (as the repository does) keeps them visible in code review.
 4. `ssh2` (used by the SFTP connection test) is listed in `serverExternalPackages` in `next.config.ts`, so the bundler leaves it alone. It has optional native dependencies (`cpu-features`, built with `nan`); npm tolerates their failing to compile, and `ssh2` falls back to pure JavaScript, so the install and the build succeed either way. If `ssh2` cannot load at runtime, only the SFTP test reports "ssh client unavailable"; the rest of the admin API is unaffected. P2c adds no environment variable: the certificate and SFTP features use the existing `CREDENTIAL_MASTER_KEY`, and the SFTP test rate limits are constants.
 5. No further Vercel-specific configuration is required. Route handlers run on the default Node.js runtime (not Edge), which is what the auth guard and Drizzle client need.
 
@@ -77,7 +77,7 @@ Run these once against a fresh `DATABASE_URL`, whether that is a local Neon bran
 npm run db:migrate
 ```
 
-This runs `db/migrate.ts`, which applies every migration file under `db/migrations/` via `drizzle-orm`'s Neon migrator. It loads `.env.local` automatically in local dev (`tsx --env-file=.env.local`); on a deploy host, ensure `DATABASE_URL` is present in the environment instead. The GitHub Actions workflow (`.github/workflows/ci.yml`) does not run migrations against a real database: it runs typecheck, lint, tests and a build only, and the tests apply the migrations to an in-memory Postgres (pglite).
+This runs `db/migrate.ts`, which applies every migration file under `db/migrations/` via `drizzle-orm`'s Neon migrator. It loads `.env.local` automatically in local dev (`tsx --env-file=.env.local`); on a deploy host, ensure `DATABASE_URL` is present in the environment instead. The GitHub Actions workflow (`.github/workflows/ci.yml`) does not run migrations against a real database: it runs the generators, typecheck, lint, `audit:log-calls`, the tests, a build and the `/demo` smoke walk, and the tests apply the migrations to an in-memory Postgres (pglite).
 
 **Migration `0002_p2a_credentials.sql` must be applied before deploying this version.** The gateway and the credential services read columns it adds (`lookup_hash`, `expires_at`, `rotated_to_id`, `username_lookup`, `system_credential.revoked_at` and a required `label`). It backfills missing labels, renames older duplicate active labels by appending `-<first 8 characters of the row id>` (the newest row keeps the label), drops the one-Basic-row-per-system index, and adds the partial unique indexes. Existing API keys, bearer tokens and Basic credentials keep working: they are verified by a fallback scoped to their own system and indexed on first use.
 
