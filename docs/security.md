@@ -193,6 +193,10 @@ The last segment of `/api/inbound/<systemCode>/<endpoint>` is validated before a
 - **Declaring any endpoint limit turns the list into the system's endpoint allowlist.** The segment is free text that reaches the same handler, so a limit keyed on the raw text would be bypassed by respelling it (`Orders`, `orders2`, `orders.`). Instead, once a system has at least one limit row, any segment outside that set is `404` "unknown endpoint". The check runs after authentication, so strangers learn nothing. The request is logged with that reason, creates no job and spends no counter. A system with no rows accepts any valid segment.
 - **Counting.** A listed endpoint consumes the bucket `sys:<systemCode>:<endpoint>`. Over the limit the answer is `429` with `Retry-After` and the activity reason "rate limited (endpoint)". The per-system limit still caps everything, and the `X-RateLimit-*` headers report the tightest bucket the request consumed.
 
+## Inbound body size
+
+The gateway reads at most 1 MiB (1,048,576 bytes) of request body. The read happens at the parse point, after authentication and the `Idempotency-Key` check, so the route reads no body from a caller it has not authenticated. The hosting framework's proxy layer may still buffer a request up to its own limit (about 10 MB by default) before the route runs; that limit is the platform's, not the gateway's. A larger body is `413 {"error":"request body too large"}`, writes its activity row with the reason "body too large", and creates no job. The declared `Content-Length` is checked first; a body without one (chunked) is counted while it streams, and the read is cancelled as soon as the count passes the cap, so an oversized body is never buffered whole. UTF-8 bytes are counted, not characters. An empty body or invalid JSON is still `400 {"error":"invalid JSON body"}`. The admin API keeps its own 64 KB cap through the same reader (`core/http/read-json-body.ts`).
+
 ## Strict payloads
 
 The gateway validates the body against the connector's zod schema with the top level strict:
@@ -514,6 +518,14 @@ The provisioned-dormant default is described in `docs/architecture.md` as a cost
 - Leaving the live state also stops a system's background work. A `SUSPENDED` or `SETUP` system fires no schedules and has its queued jobs held, and a deleted system's queued jobs fail; nothing catches up when it is activated or restored (see "Deleting and suspending systems").
 - The Queue page (P4d) shows this posture to an operator: whether the timer tick is armed, whether its signing keys are set, and when the last drain window ran (see "Queue and dashboards (P4d)" in `docs/architecture.md`). The posture fields are presence only. `tickSigning` says that both QStash signing keys are set (or that the non-production dev bypass is on) and never carries, logs or derives anything from a key value; `core/jobs/qstash-signing.ts` returns a boolean and nothing else. `dashboard.queue` is a passive read: it triggers no drain window, so looking at a dormant deploy does not wake it.
 - This means the platform's default failure mode, for both a fresh deploy and a partially configured one, is silence rather than partial exposure.
+
+## Dependency audit
+
+`npm audit` runs before each release. The state after P5z (Next.js 16.4.3, next-auth 4.24.15, undici 7.30.1, postcss 8.5.23, tsx 4.23.15, vitest 4.1.12, all pinned exactly):
+
+- **Accepted, production: zod 3.24.1 and zod-to-json-schema** (high, GHSA-mrhx-c7xc-m3w5). The advisory concerns very large inputs. Every input zod parses is bounded first: the admin API reads at most 64 KB of body and the inbound gateway at most 1 MiB (see "Inbound body size"). A zod major upgrade would touch every schema in the codebase, so it is deferred to its own change.
+- **Accepted, development only:** drizzle-kit, @esbuild-kit and esbuild (GHSA-67mh-4wv8-2f99), and eslint-config-next, typescript-eslint and minimatch (GHSA-g3hv-75wg-m249). These run only on a developer machine or in CI and never ship in the build.
+- **Override:** `package.json` pins the transitive `fast-uri` to 3.1.9, its first fixed version (`package.json` takes no comments, so the reason is recorded here). Remove the override once the packages that depend on it require a fixed version themselves.
 
 ## Threat model: a compromised partner credential
 
