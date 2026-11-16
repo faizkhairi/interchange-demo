@@ -137,6 +137,7 @@ Every unauthenticated outcome returns the same body, so a caller cannot tell a m
 | Bad token, unknown or revoked key, expired, lifetime too long | `401` | invalid service token, unknown service key, service token expired, service token lifetime too long |
 | Key row cannot be decrypted | `401` | service key unreadable |
 | `sys` names another system | `403` | service token for another system |
+| A short-lived database failure before the job is written | `503 {"error":"UNAVAILABLE"}` with `Retry-After: 5`; retry later | service unavailable |
 
 Sources: `core/auth/with-partner-auth.ts:205`, `core/auth/with-partner-auth.ts:335`, `core/auth/with-partner-auth.ts:351`, `core/auth/with-partner-auth.ts:357`, `core/auth/with-partner-auth.ts:118-123`, `core/auth/with-partner-auth.ts:71`, `src/app/api/inbound/[systemCode]/[endpoint]/route.ts:300`, `core/auth/service-token.ts:57`, `core/auth/service-token.ts:144-146`, `core/auth/service-token.ts:159`, `core/auth/service-token.ts:165`, `core/auth/service-token.ts:169`.
 
