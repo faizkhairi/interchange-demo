@@ -179,13 +179,13 @@ After rotating the Vercel token in the Vercel account, run that command again wi
 
 Name `Health`. It runs on the cron `17 * * * *` (minute 17 of every hour, UTC) and can be started by hand (`workflow_dispatch`) (`.github/workflows/health.yml:3-6`). The job has a 5 minute timeout, a sparse checkout of `scripts/ci` only, and `persist-credentials: false` (`.github/workflows/health.yml:14-21`). It runs `scripts/ci/health-check.sh` with 3 tries 30 seconds apart (`.github/workflows/health.yml:22-26`).
 
-The check passes only on HTTP `200` with `status` equal to `ok` and `db` equal to `ok`. It fails on a non-200 answer, a `status` that is not `ok`, or a `db` that is not `ok`, and on failure prints only the HTTP code and those two fields, never the body (`scripts/ci/health-check.sh:19-34`). A failed run shows red in the Actions tab; GitHub's notification settings decide whether anyone is emailed. GitHub may start a scheduled run late under load.
+The check passes only on HTTP `200` with `status` equal to `ok` and `db` equal to `ok`. It fails on a non-200 answer, a `status` that is not `ok`, or a `db` that is not `ok`, and on failure prints only the HTTP code and those two fields, never the body (`scripts/ci/health-check.sh:19-34`). A failed run shows red in the Actions tab; GitHub's notification settings decide whether anyone is emailed. GitHub runs a schedule on a best-effort basis: it may start a run late or skip it. Measured here, 1 scheduled run started in the 17 hourly slots from 2026-11-16 18:17 to 2026-11-17 10:17 UTC. For a check that must run on time, point an external HTTP monitor at `GET /api/health` with a keyword match on `"db":"ok"` and email alerts (for example the free plan of Better Stack or UptimeRobot, after checking the provider's current terms); the workflow stays as a second signal.
 
 ### Risks and limits
 
 - **Actions minutes.** The hourly Health run costs about 720 minutes a month (24 runs a day, billed at least one minute each). The Free plan includes 2,000 minutes a month for private repositories. The `verify` job also costs 16 to 25 minutes per push to `main` and per pull request run, plus the deploy job. Heavy pushing plus the hourly check can reach the limit. A 2-hourly cron (`17 */2 * * *`) halves the Health cost. Check Settings, Billing, Actions usage before raising the cadence.
 - **Secrets are repository secrets**, not an Environment (see above).
-- **Actions are pinned by tag** (`actions/checkout@v4`, `actions/setup-node@v4`), like the rest of the workflow. A tag can move. Pinning to a full commit SHA is stronger; it is not done here.
+- **Actions are pinned to full commit SHAs**, with the release tag in a comment (`actions/checkout` v7.0.1, `actions/setup-node` v7.1.0), because a tag can move. To update one, resolve the new release tag to its commit and replace the SHA and the comment together. No bot opens these updates, since each update run costs `verify` minutes.
 - **No automatic rollback.** A failed Health smoke leaves the new deployment live. Roll back by promoting the previous deployment (the rollback section of the operations runbook, in the source repository); a migration is not reversed by a rollback.
 - **The deploy job builds on Vercel**, so a build that passes in CI can still fail there; the job fails in that case and production keeps the previous deployment.
 - **Manual deploys still work.** The job is a convenience, not a lock. A deploy made by hand with the Vercel CLI carries no `githubCommitSha` unless the command sets it, and the gate then falls back to `github.event.before` as its baseline (`scripts/ci/migration-gate.sh:59-68`).
@@ -198,7 +198,7 @@ The check passes only on HTTP `200` with `status` equal to `ok` and `db` equal t
 | Migration gate on a push with no migration change | `PASS`, baseline read from the production deployment's `githubCommitSha` |
 | Migration gate failure on a migration push without the marker | Not run live (it needs a real migration push). A dry run of the gate script covered it with a local diff: exit 1 and `FAIL` before any deploy, and exit 0 with the `migration-applied` marker. The same dry run covered the fallbacks: meta missing, meta not in history, `event.before` unreachable or all zeros |
 | Health smoke after deploy | Passed on try 1 (HTTP 200, `status` ok, `db` ok) |
-| Health workflow | A manual run (`workflow_dispatch`) passed in 11 seconds. No scheduled run had started at the first hourly slot after the push (18:17 UTC): GitHub can start a new schedule late or skip a slot, so confirm the cadence in the Actions tab |
+| Health workflow | A manual run (`workflow_dispatch`) passed in 11 seconds. Over the next 17 hourly slots (2026-11-16 18:17 to 2026-11-17 10:17 UTC) only 1 scheduled run started (01:51 UTC, passed), so the schedule is best effort; an external monitor is the reliable option (see above) |
 
 ## Activating the dormant platform for a real project
 
@@ -238,7 +238,7 @@ None of steps 2 to 6 require a redeploy. They are all admin-console or QStash-da
 
 Because the platform is dormant by default and stays dormant until explicitly activated, an unconfigured or lightly used deployment has close to zero idle cost:
 
-- Neon's serverless Postgres scales to near-zero compute when idle, and the free tier covers a project's own schema comfortably at this size (31 core tables plus the opt-in upstream table).
+- Neon's serverless Postgres scales to near-zero compute when idle, and the free tier covers a project's own schema comfortably at this size (32 core tables plus the opt-in upstream table).
 - Vercel's serverless functions only run (and only bill) when a request actually arrives; there is no long-running worker process consuming compute between requests.
 - No QStash schedule exists, and therefore no timer tick runs and nothing recurring is billed, until a project explicitly arms one. A dormant deploy still has the throttled after-response drain: at most once per 60 seconds it reclaims stuck jobs and drains up to 3 due jobs (stopping 15 seconds in), triggered by console reads and by authenticated inbound calls answered under 400. With an empty queue it only writes its `drain_last_run` stamp; it writes a `process_log` row only when it did work. It makes outbound calls only for jobs that are already queued, so it adds function time only where there is work.
 

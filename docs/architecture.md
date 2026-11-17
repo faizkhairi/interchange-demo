@@ -283,7 +283,7 @@ Every server-side HTTP request to a URL an administrator typed goes through `saf
 
 ## The two-database model
 
-Interchange's own schema (31 core tables plus one opt-in table) is the platform's single source of truth for partner registry, credentials, jobs, and audit history. This is always present.
+Interchange's own schema (32 core tables plus one opt-in table) is the platform's single source of truth for partner registry, credentials, jobs, and audit history. This is always present.
 
 Separately, a connector may need to read from a partner's or a project's own upstream system: a legacy database, an internal REST API, whatever the integration needs. Interchange models this as `upstream_data_source` (`db/schema/upstream.ts`), explicitly marked as **opt-in and not part of the core tables**:
 
@@ -634,7 +634,7 @@ Source: `core/pure/alert-delivery.ts`, `core/jobs/alert-delivery.ts`, `core/serv
 | Async inbound: payload vault (seal, open, purge), purpose-key crypto | `core/jobs/payload-vault.ts`, `core/crypto/vault.ts` (`encryptForPurpose`) |
 | Async inbound migration (`accepted_async`, `job_payload_vault`) | `db/migrations/0013_async_inbound.sql` |
 | Operational schema (12 tables) | `db/schema/operational.ts` |
-| Config/auth schema (19 tables) | `db/schema/config-auth.ts` |
+| Config/auth schema (20 tables) | `db/schema/config-auth.ts` |
 | Opt-in upstream schema | `db/schema/upstream.ts` |
 | DB client | `core/db.ts` |
 | Admin API contract | `src/admin-api/contract.ts` |
