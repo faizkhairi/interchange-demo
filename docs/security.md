@@ -144,7 +144,7 @@ The gateway reads at most 1 MiB (1,048,576 bytes) of request body. The read happ
 The gateway validates the body against the connector's zod schema with the top level strict:
 
 - **Unknown top-level keys are refused**, not dropped: `422 {"error":"payload validation failed","unknownKeys":["extra"],"details":{...}}`. Names are sorted, at most 20 are listed and each is cut at 64 characters; `unknownKeysTruncated: true` marks a longer list. Values are never reported. The activity row stores `{"reason":"unknown keys","unknownKeys":[...]}` only, so a secret sent under a misspelled key is not written to the log.
-- **Other validation failures** keep zod's `flatten` shape in `details`, but every message comes from one no-echo mapper: an enum failure lists the allowed values and never the submitted one.
+- **Other validation failures** keep zod's `flatten` shape in `details`, but every message comes from one no-echo mapper: an enum failure (`invalid_value`) lists the allowed values and never the submitted one.
 - **Only the top level is strict.** Nested objects follow the connector's own schema.
 - **Same rule for a manual run.** `jobs.run` in the admin API refuses an unknown payload key with a validation issue `unrecognized_keys` under `payload`. The drain keeps a lenient parse of payloads already stored, so rows queued before this rule never dead-letter on it.
 - **Fail closed on the schema itself.** A connector whose input schema is not a plain object, or uses a catch-all, cannot be checked for unknown keys. The gateway answers `500 {"error":"internal error"}` and a registry test asserts every shipped schema is an object.
@@ -312,7 +312,7 @@ Client-side route redirects and hidden UI elements are UX conveniences only. `re
 4. checks the endpoint's permission against the database (`requirePermission`), before any input is parsed;
 5. applies the per-user rate limit (`admin:user:<user id>`), only after authorization, so refused and anonymous requests never spend a real user's budget (429 `RATE_LIMITED`);
 6. reads the body with a 64 KB cap (413) and validates input with zod (400);
-7. runs the service and returns JSON in one error envelope, `{"error":{"code","message","requestId","issues?"}}`. Validation `issues` carry paths and messages, never submitted values, and an unexpected failure returns a fixed `INTERNAL` message while the detail is logged server-side with the request id.
+7. runs the service and returns JSON in one error envelope, `{"error":{"code","message","requestId","issues?"}}`. Validation `issues` carry paths and messages, never submitted values (issue codes follow zod 4 names since P7d, for example `invalid_value` and `invalid_format`), and an unexpected failure returns a fixed `INTERNAL` message while the detail is logged server-side with the request id.
 
 Every `/api/admin/*` response carries `Cache-Control: no-store`, because one of them returns a plaintext API key exactly once.
 
@@ -480,10 +480,10 @@ The provisioned-dormant default is described in `docs/architecture.md` as a cost
 
 ## Dependency audit
 
-`npm audit` runs before each release. The state after P5z (Next.js 16.4.3, next-auth 4.24.15, undici 7.30.1, postcss 8.5.23, tsx 4.23.15, vitest 4.1.12, all pinned exactly):
+`npm audit` runs before each release. The state after P7d (Next.js 16.4.5, zod 4.6.7, next-auth 4.24.15, undici 7.30.1, postcss 8.5.23, tsx 4.23.15, vitest 4.1.12, all pinned exactly): `npm audit --omit=dev` reads 0, and the GitHub Actions SHA pins are kept fresh by a monthly grouped Dependabot PR.
 
-- **Accepted, production: zod 3.24.1 and zod-to-json-schema** (high, GHSA-mrhx-c7xc-m3w5). The advisory concerns very large inputs. Every input zod parses is bounded first: the admin API reads at most 64 KB of body and the inbound gateway at most 1 MiB (see "Inbound body size"). A zod major upgrade would touch every schema in the codebase, so it is deferred to its own change.
-- **Accepted, development only:** drizzle-kit, @esbuild-kit and esbuild (GHSA-67mh-4wv8-2f99), and eslint-config-next, typescript-eslint and minimatch (GHSA-g3hv-75wg-m249). These run only on a developer machine or in CI and never ship in the build.
+- **Fixed, production:** Next.js 16.4.5 (GHSA-mfr8-8qww-v76h; the app is not exposed, since it uses no `use cache` or `unstable_cache`) and zod 4.6.7 (GHSA-mrhx-c7xc-m3w5: array, set and map bounds are now checked before the elements, so an oversized failing array gives one issue instead of one per element). Every input zod parses is also bounded first: the admin API reads at most 64 KB of body and the inbound gateway at most 1 MiB (see "Inbound body size"). `zod-to-json-schema` was removed: both generators use zod's own `z.toJSONSchema`.
+- **Accepted, development only:** the typescript-eslint chain via minimatch (GHSA-g3hv-75wg-m249; the fix needs typescript-eslint 8.73.0, released 2026-11-16, which is held under a 7-day supply-chain cooldown and goes in as a lockfile-only update from 2026-11-23) and the drizzle-kit chain via @esbuild-kit and esbuild (GHSA-67mh-4wv8-2f99; there is no non-breaking fix, and the 0.18.1 that npm suggests is a downgrade). None of them ships in the build; they run only on a developer machine or in CI.
 - **Override:** `package.json` pins the transitive `fast-uri` to 3.1.9, its first fixed version (`package.json` takes no comments, so the reason is recorded here). Remove the override once the packages that depend on it require a fixed version themselves.
 
 ## Threat model: a compromised partner credential
