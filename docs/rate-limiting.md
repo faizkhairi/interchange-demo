@@ -75,7 +75,7 @@ If the database cannot be reached, `consumeRateLimit` logs one warning and admit
 
 This is a documented, deliberate limit: a limiter outage must not become a gateway outage or lock administrators out (`core/gateway/rate-limit.ts:9-13`). The cost is brief over-admission while the store is down. Because the login throttle uses the same function, it fails open too.
 
-The per-IP limits are only as sound as the client address. The address is read from `x-vercel-forwarded-for`, then `x-real-ip`, then the first `x-forwarded-for` entry, and must parse as an IP, otherwise it is `unknown` and shares one bucket (`core/gateway/rate-limit.ts:42-62`). Behind a host that passes client-supplied headers through, a caller can pick its own bucket.
+The per-IP limits are only as sound as the client address. The address is read from `x-vercel-forwarded-for`, then `x-real-ip`, then the first `x-forwarded-for` entry, and must parse as an IP, otherwise it is `unknown` and shares one bucket (`core/gateway/rate-limit.ts:42-66`). The first header is read only when `VERCEL=1`, which Vercel sets on every deployment; elsewhere it is ignored, because any client can send it. A self-hosted deployment therefore relies on a reverse proxy that overwrites `X-Real-IP` and `X-Forwarded-For`. Behind a host that passes client-supplied headers through, a caller can pick its own bucket.
 
 ## Not a limiter
 

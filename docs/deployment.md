@@ -1,16 +1,33 @@
 # Deployment
 
-Last updated: 2026-11-17
+Last updated: 2026-11-18
 
-This document covers deploying Interchange: required environment variables, setting up Neon, deploying to Vercel, running migrations and the seed, the automated deploy job and hourly health workflow in GitHub Actions, and the steps to activate the platform for a real project once it is deployed.
+This document covers deploying Interchange: what you need to run it, the environment variables, self-hosting with Docker Compose, the optional Neon and Vercel deployment, running migrations and the seed, the automated deploy job and the best-effort health workflow in GitHub Actions, and the steps to activate the platform for a real project once it is deployed.
+
+## What you need to run it
+
+Required:
+
+- A PostgreSQL database. CI proves PostgreSQL 17 (the compose file pins 17.10) and production runs on Neon; older majors are not tested.
+- A Node 22 host, or a container runtime that can run the supplied `Dockerfile` and `compose.yaml` (see "Self-hosting").
+- Something that calls the job tick if you want scheduled or retried work on a timer: the bundled cron sidecar, an operating-system cron entry, or QStash. A deployment with no timer still works (see "With the tick dormant" below).
+
+Optional. None of these is needed to run the platform:
+
+| Service | What it adds |
+|---|---|
+| Vercel | Managed hosting for the app, and the automated `deploy` job in `.github/workflows/ci.yml`. |
+| Neon | Managed serverless Postgres. A `DATABASE_URL` host ending in `.neon.tech` selects the Neon serverless driver. |
+| Upstash QStash | A hosted scheduler that calls the job tick. `CRON_SECRET` with the cron sidecar or an operating-system cron entry replaces it. |
 
 ## Environment variables
 
-Copy `.env.example` to `.env.local` for local development, and set the same values in your Vercel project's environment variables for each deploy target (Preview / Production).
+Copy `.env.example` to `.env.local` for local development, and set the same values in the environment of whatever runs the app (for Vercel, the project's environment variables for each deploy target, Preview and Production). The compose stack reads its own, shorter list from a `.env` file; see "Self-hosting".
 
 | Variable | Required | Purpose |
 |---|---|---|
-| `DATABASE_URL` | Yes | Neon Postgres pooled connection string. The platform's own database (see the two-database model in `docs/architecture.md`). |
+| `DATABASE_URL` | Yes | Postgres connection string. The platform's own database (see the two-database model in `docs/architecture.md`). A host ending in `.neon.tech` uses the Neon serverless driver (use the pooled string); any other host uses node-postgres (`pg`). |
+| `DATABASE_DRIVER` | No | `neon` or `pg`. Overrides the choice made from the `DATABASE_URL` host. Empty counts as unset; any other value fails at startup with a message that names the variable, not its value. Leave it unset unless you front Postgres with a host name that hides what it is (`db/driver.ts`). |
 | `CREDENTIAL_MASTER_KEY` | Yes | 64 hex characters (32 bytes). AES-256-GCM master key used to encrypt outbound partner credentials at rest. It also encrypts the queued payloads of async (202) inbound calls, through a separate derived key, for at most 24 hours each. Generate with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`. Never prefix with `NEXT_PUBLIC_`; it must never reach the client. |
 | `CREDENTIAL_MASTER_KEY_PREVIOUS` | No | Prior 64-hex master key (key version 0). Set it to the old value when you rotate: a blob that fails to decrypt under the current key is then tried under this one (`core/crypto/vault.ts:116-133`), and `npm run rekey` moves the blobs to the current key (`scripts/rekey.ts:1-37`). Unset it after the re-key. See "Master-key rotation" below and the operations runbook, section 3 (in the source repository). |
 | `NEXTAUTH_SECRET` | Yes | next-auth session secret. Generate with `openssl rand -base64 32`. |
@@ -19,7 +36,8 @@ Copy `.env.example` to `.env.local` for local development, and set the same valu
 | `QSTASH_TOKEN` | No | Upstash QStash token, used only to register or delete the one platform tick schedule (`armTick()` / `disarmTick()`). Leave unset for a dormant deploy: nothing can be armed. |
 | `QSTASH_TICK_CRON` | No | Cadence of the single platform tick (default `*/5 * * * *`, UTC). Job schedules are evaluated by the tick, so none can run more often than this. Takes effect when the tick is (re-)armed. |
 | `ACTIVITY_RETENTION_DAYS` | No | Fallback only: `activity_log` retention in days (default `30`) when no `retention` row exists in `app_setting`. The row (`{enabled, activityDays, jobDays}`, days 1 to 365; `jobDays` defaults to 30 and covers jobs, step logs and process runs, and a stored row without it reads 30) is edited from the Activity log screen and wins over this variable; `enabled: false` stops every automatic delete. Pruning runs from the tick and from a throttled trigger after inbound requests, so a deployment with the tick dormant prunes only after traffic. P3a adds no new environment variable, and neither does P3b. |
-| `QSTASH_CURRENT_SIGNING_KEY` / `QSTASH_NEXT_SIGNING_KEY` | Yes, to use any `/api/jobs/*` route | QStash request-signing keys. `/api/jobs/tick`, `/dispatch` and `/process` verify the `Upstash-Signature` header with them and **fail closed**: with either key unset they return 503. Set both (from the QStash console) before arming. |
+| `QSTASH_CURRENT_SIGNING_KEY` / `QSTASH_NEXT_SIGNING_KEY` | Yes, to use any `/api/jobs/*` route | QStash request-signing keys. `/api/jobs/tick`, `/dispatch` and `/process` verify the `Upstash-Signature` header with them and **fail closed**: with either key unset they return 503. Set both (from the QStash console) before arming. Not needed when the tick is driven with `CRON_SECRET`. |
+| `CRON_SECRET` | No | At least 32 characters; a shorter value counts as unset. When set, `/api/jobs/tick`, `/dispatch` and `/process` also accept `Authorization: Bearer <CRON_SECRET>`, so any scheduler that can send an HTTP POST can drive the tick without QStash. Generate with `openssl rand -hex 24`. It is compared in constant time, and a request that carries a QStash signature is always judged by the QStash check. See "Self-hosting" and `docs/security.md`. |
 | `QSTASH_DEV_BYPASS` | No | Set to `1` to let the job endpoints run unsigned for local testing. Honoured only when `NODE_ENV` is not `production`; it does nothing in production. |
 | `JOB_STUCK_MINUTES` | No | A job left `PROCESSING` longer than this (default `10`) is reclaimed by the tick: an outbound job goes back to `RETRY` with backoff, or to the DLQ when attempts are exhausted; an async (202) inbound job does the same, with code `RECLAIMED`; an inline inbound job goes to `FAILED` and is not re-executed. Outbound handlers and connectors that set `asyncInbound` must therefore be idempotent. The same value sets the Stuck card threshold on the Queue page (P4d), so the card counts what the next reclaim would take. |
 | `RATE_LIMIT_IP_RPM` | No | Per-client-IP inbound request limit per minute (default `250`). The per-system limit is `external_system.rate_limit_rpm`, set per system. |
@@ -32,7 +50,7 @@ Copy `.env.example` to `.env.local` for local development, and set the same valu
 | `SEED_ADMIN_PASSWORD` | **Required unless the database is local** | Password for the seeded admin. The seed throws if it is unset in production, and also whenever `DATABASE_URL` does not point at `localhost` / `127.0.0.1`, regardless of `NODE_ENV`. |
 | `SEED_ALLOW_DEFAULT` | No | Set to exactly `1` to let the seed use the published development default password against a non-local database. Do not set it for anything reachable. |
 
-A dormant deploy needs only `DATABASE_URL`, `CREDENTIAL_MASTER_KEY`, and `NEXTAUTH_SECRET` / `NEXTAUTH_URL` to boot and serve the admin console. The QStash keys are needed only once you want the job endpoints to answer.
+A dormant deploy needs only `DATABASE_URL`, `CREDENTIAL_MASTER_KEY`, and `NEXTAUTH_SECRET` / `NEXTAUTH_URL` to boot and serve the admin console. The QStash keys, or `CRON_SECRET`, are needed only once you want the job endpoints to answer.
 
 `ADMIN_RATE_LIMIT_IP_RPM`, `ADMIN_RATE_LIMIT_USER_RPM`, `CORS_ALLOWED_ORIGINS`, `CREDENTIALS_REVEAL_ENABLED` and `CREDENTIALS_REVEAL_LIMIT` are optional and safe when unset (default limits, an empty env CORS list, reveal off). Leave them unset on Vercel unless you have a specific need; unset is the intended production posture. With `CORS_ALLOWED_ORIGINS` unset, inbound browser access is still possible, but only for origins an operator has added to a specific system's own CORS list.
 
@@ -48,13 +66,17 @@ It prints only the token, to be sent as `X-Service-Token` next to the partner cr
 
 **Master-key rotation.** To rotate `CREDENTIAL_MASTER_KEY`, move the old value to `CREDENTIAL_MASTER_KEY_PREVIOUS` and set the new one. Every blob records a `keyVersion`, but every writer stamps 1, so the version is a slot name and not a key identity (`core/crypto/vault.ts:37-55`). Decrypt reads with the key the blob names; only when that key's authentication tag fails, and only when the other slot is set and holds a different key, it tries the other slot once with the same purpose and AAD (`core/crypto/vault.ts:116-133`). A missing key, a wrong AAD or purpose, tampered bytes and a previous key equal to the current key still fail. So the env flip (old value into `CREDENTIAL_MASTER_KEY_PREVIOUS`, new value into `CREDENTIAL_MASTER_KEY`) causes no outage, and `npm run rekey` (a dry run; `-- --apply` writes) then re-encrypts every stored secret under the current key: outbound credentials, type defaults, storage and SFTP secrets, certificate keys, service keys and queued async payloads (`scripts/rekey.ts:1-37`, `scripts/rekey.ts:106-128`). After a clean re-run, unset `CREDENTIAL_MASTER_KEY_PREVIOUS` and redeploy so the retired key stops opening blobs. The Basic username lookup cannot be re-keyed (the username is stored only as a salted hash), so `--apply` clears it and each Basic credential is re-indexed the next time it authenticates on its own system (`scripts/rekey.ts:327-335`, `core/auth/with-partner-auth.ts:308-317`); until then a live Basic credential presented to the wrong system answers 401 instead of 403, and one never used before the previous key is unset is not found (401) until it is reissued. Follow the operations runbook, section 3 (in the source repository) for the full procedure.
 
-## Neon setup
+## Optional: Neon and Vercel
+
+The next two sections describe one optional deployment: Neon for the database and Vercel for the app. It is how the hosted demo runs, and nothing else in this document depends on it. To run on your own Postgres and host, skip to "Self-hosting".
+
+### Neon setup
 
 1. Create a Neon project (https://neon.tech). Neon's serverless Postgres is what makes this stack work well on Vercel: connections are pooled over WebSocket rather than long-lived TCP, which matches serverless function lifecycles.
 2. Copy the pooled connection string (Neon dashboard shows both a direct and a pooled variant; use the pooled one, it ends in `-pooler` in the host) into `DATABASE_URL`.
-3. No manual schema setup is needed beyond running migrations (next section). `core/db.ts` and `db/migrate.ts` both connect through `@neondatabase/serverless`'s `Pool`, which is what `drizzle-orm/neon-serverless` expects.
+3. No manual schema setup is needed beyond running migrations (see "Migration and seed steps"). `db/driver.ts` picks the driver from the `DATABASE_URL` host: a `.neon.tech` host connects through `@neondatabase/serverless`'s `Pool`, which is what `drizzle-orm/neon-serverless` expects, and the app, `db/migrate.ts`, `db/seed.ts` and `scripts/rekey.ts` all go through that selection. Any other host uses node-postgres.
 
-## Vercel deploy
+### Vercel deploy
 
 1. Import the repository into Vercel as a Next.js project. Framework detection is automatic for Next.js 16.
 2. Set the environment variables from the table above in the Vercel project settings, for whichever environments you deploy (Production, and Preview if you want preview deploys to also work end to end).
@@ -69,15 +91,85 @@ It prints only the token, to be sent as `X-Service-Token` next to the partner cr
 4. `ssh2` (used by the SFTP connection test) is listed in `serverExternalPackages` in `next.config.ts`, so the bundler leaves it alone. It has optional native dependencies (`cpu-features`, built with `nan`); npm tolerates their failing to compile, and `ssh2` falls back to pure JavaScript, so the install and the build succeed either way. If `ssh2` cannot load at runtime, only the SFTP test reports "ssh client unavailable"; the rest of the admin API is unaffected. P2c adds no environment variable: the certificate and SFTP features use the existing `CREDENTIAL_MASTER_KEY`, and the SFTP test rate limits are constants.
 5. `vercel.json` pins the functions to one region, `sin1`, next to the database. Set it to the Vercel region closest to your Neon project's region: a request makes several sequential database round trips (about 15 on an inbound call), and each one costs about 200 ms when the database is on another continent. `/api/health` reports the time of its probe query as `Server-Timing: db;dur=<ms>` (`src/app/api/health/route.ts:31`); a few milliseconds means the two are co-located. On 2026-11-16 the median of 20 reads was 218 ms from `iad1` and 3 ms from `sin1`. No further Vercel-specific configuration is required. Route handlers run on the default Node.js runtime (not Edge), which is what the auth guard and Drizzle client need.
 
+## Self-hosting
+
+This path needs only Docker with Compose and a machine to run it on. The repository ships a `Dockerfile` (Node 22; targets `deps`, `build`, `runner` and `tools`) and a `compose.yaml` with four services:
+
+| Service | What it does |
+|---|---|
+| `db` | Postgres 17. No published port: it is reachable only on the compose network. Data lives in the `pgdata` volume. |
+| `setup` | A one-shot job built from the `tools` target. It applies the migrations, then runs the seed, then exits. `app` waits for it to finish successfully. |
+| `app` | The production server (`NEXT_OUTPUT=standalone` build), published on `127.0.0.1:3000` only, with a health check on `/api/health`. |
+| `cron` | A sidecar that runs `node scripts/cron-tick.mjs --every ${CRON_INTERVAL_SECONDS:-300}`, which posts to the authenticated job tick. |
+
+### Quick start
+
+1. Create a `.env` file next to `compose.yaml` with these values. Every required one makes compose stop with a message when it is missing.
+
+   | Variable | Required | Notes |
+   |---|---|---|
+   | `POSTGRES_PASSWORD` | Yes | Use a URL-safe value such as hex (`openssl rand -hex 16`); it is embedded in `DATABASE_URL`. |
+   | `CREDENTIAL_MASTER_KEY` | Yes | 64 hex characters (`openssl rand -hex 32`). Back it up: without it the encrypted credentials cannot be read. |
+   | `NEXTAUTH_SECRET` | Yes | `openssl rand -hex 32`. |
+   | `CRON_SECRET` | Yes | At least 32 characters (`openssl rand -hex 24`). The sidecar and the app share it. |
+   | `SEED_ADMIN_PASSWORD` | Yes | Password of the seeded admin. The seed refuses to run without it against this database. |
+   | `NEXTAUTH_URL` | No | Public URL of the app. Defaults to `http://localhost:3000`. Set it to the address users type once a reverse proxy is in front. |
+   | `SEED_ADMIN_EMAIL` | No | Defaults to `admin@interchange.local`. |
+   | `CRON_INTERVAL_SECONDS` | No | Tick interval in seconds. Defaults to 300. |
+
+2. Build and start:
+
+   ```
+   docker compose up -d --build
+   ```
+
+   Compose starts `db`, runs `setup` to completion (migrate, then seed), then starts `app` and `cron`. Check it with `docker compose ps` and `curl http://127.0.0.1:3000/api/health` (expect HTTP 200 with `status` and `db` both `ok`).
+3. Sign in at `http://127.0.0.1:3000/login` as the seeded admin, change the password on the Profile page and continue with "Activating the dormant platform for a real project".
+
+To upgrade, pull the new code and run `docker compose up -d --build`; run `docker compose run --rm setup` first if you want to apply migrations before the new app starts. The seed is safe to re-run, but it resets the `operator` and `viewer` role permissions to the catalog defaults (see "Migration and seed steps"). Read the per-migration notes before a version upgrade, as for any other deployment.
+
+### Reverse proxy
+
+The app is published on `127.0.0.1` on purpose. Put a reverse proxy in front of it to terminate TLS, and make the proxy overwrite `X-Real-IP` and `X-Forwarded-For` with the address it saw. The per-IP rate limits key on that address. The app trusts `x-vercel-forwarded-for` only when `VERCEL=1`, which Vercel sets and a self-hosted deployment does not, so a client cannot choose its own rate-limit key with that header. Without a proxy that overwrites the other two headers, a client can still choose its own key with them (see `docs/rate-limiting.md` and `docs/security.md`).
+
+For nginx, set both headers to the connecting address rather than appending to what the client sent:
+
+```
+proxy_set_header X-Real-IP $remote_addr;
+proxy_set_header X-Forwarded-For $remote_addr;
+```
+
+For Caddy, `reverse_proxy` already replaces `X-Forwarded-For` from untrusted clients; add `header_up X-Real-IP {remote_host}` so the first header the app reads is also set by the proxy.
+
+### The job tick: sidecar or operating-system cron
+
+The platform has one timer, the job tick. Self-hosted, the tick is driven by `CRON_SECRET`:
+
+- **Compose sidecar.** The `cron` service in `compose.yaml` does it for you.
+- **Operating-system cron.** Run `node scripts/cron-tick.mjs` (Node 22, no dependencies) once per interval, with `CRON_SECRET` in its environment and `TICK_URL` set when the app is not at `http://127.0.0.1:3000/api/jobs/tick`. It exits 0 on a 2xx answer and 1 otherwise, and prints only a timestamp and the status code, never the secret. A crontab line looks like `*/5 * * * * cd /opt/interchange && set -a && . ./.env && set +a && node scripts/cron-tick.mjs`.
+- **Loop mode.** `node scripts/cron-tick.mjs --every <seconds>` keeps posting until stopped. The interval must be a whole number from 10 to 600 seconds. Use 300 or less: the `tick_stale` alert fires after 15 minutes without a tick.
+
+The tick endpoints accept a QStash signature or the `CRON_SECRET` bearer, and nothing else: a request with neither is refused (401 for a wrong secret, 503 when it falls through to the QStash check and QStash keys are not configured). The mode shows on the Schedules page: with `CRON_SECRET` set and a cron tick recorded, the page reads cron mode and hides Arm and Disarm. To stop the timer, stop the scheduler and unset `CRON_SECRET`. A Vercel Cron job cannot drive it: Vercel Cron sends GET and the job routes accept POST only.
+
+### Backups and what the stack does not do
+
+- **Backups are yours.** The stack does not back up the database. Dump it on a schedule, for example `docker compose exec -T db pg_dump -U interchange interchange > backup.sql`, and keep `CREDENTIAL_MASTER_KEY` with the backup.
+- **No TLS.** Terminate it at the reverse proxy.
+- **Build needs network.** The image build downloads Google Fonts through `next/font/google`, so it cannot run offline.
+- **Tested on Postgres 17.** Older majors are not tested.
+- **Without Docker.** Any Node 22 host works: `npm ci`, then `npx tsx db/migrate.ts` and `npx tsx db/seed.ts` with the variables in the environment (`npm run db:migrate` and `npm run db:seed` read them from `.env.local` instead), then `npm run build` and `npm start`, plus an operating-system cron entry for the tick.
+
+CI proves this stack from a clean checkout on every pull request and every push to `main`: see the `selfhost` row in "Verified live".
+
 ## Migration and seed steps
 
-Run these once against a fresh `DATABASE_URL`, whether that is a local Neon branch or the production database:
+Run these once against a fresh `DATABASE_URL`, whether that is a local Postgres, a Neon branch or the production database. The compose stack's `setup` service does this for you:
 
 ```
 npm run db:migrate
 ```
 
-This runs `db/migrate.ts`, which applies every migration file under `db/migrations/` via `drizzle-orm`'s Neon migrator. It loads `.env.local` automatically in local dev (`tsx --env-file=.env.local`); on a deploy host, ensure `DATABASE_URL` is present in the environment instead. The GitHub Actions workflow (`.github/workflows/ci.yml`) does not run migrations against a real database: it runs the generators, typecheck, lint, `audit:log-calls`, the tests, a build and the `/demo` smoke walk, and the tests apply the migrations to an in-memory Postgres (pglite). Its `deploy` job (P7b) runs after those checks on a push to `main` and still does not migrate: it refuses to deploy a push that changes `db/migrations/` unless the head commit message says the migration was applied by hand (see "Automated deploy and the Health workflow (P7b)" below).
+This runs `db/migrate.ts`, which applies every migration file under `db/migrations/` via `drizzle-orm`'s migrator for whichever driver `db/driver.ts` selected for the `DATABASE_URL` host. It loads `.env.local` automatically in local dev (`tsx --env-file=.env.local`); on a deploy host, ensure `DATABASE_URL` is present in the environment instead. The GitHub Actions workflow (`.github/workflows/ci.yml`) does not run migrations against a real database: it runs the generators, typecheck, lint, `audit:log-calls`, the tests, a build and the `/demo` smoke walk, and the tests apply the migrations to an in-memory Postgres (pglite). Its `deploy` job (P7b) runs after those checks on a push to `main` and still does not migrate: it refuses to deploy a push that changes `db/migrations/` unless the head commit message says the migration was applied by hand (see "Automated deploy and the Health workflow (P7b)" below).
 
 **Migration `0002_p2a_credentials.sql` must be applied before deploying this version.** The gateway and the credential services read columns it adds (`lookup_hash`, `expires_at`, `rotated_to_id`, `username_lookup`, `system_credential.revoked_at` and a required `label`). It backfills missing labels, renames older duplicate active labels by appending `-<first 8 characters of the row id>` (the newest row keeps the label), drops the one-Basic-row-per-system index, and adds the partial unique indexes. Existing API keys, bearer tokens and Basic credentials keep working: they are verified by a fallback scoped to their own system and indexed on first use.
 
@@ -170,16 +262,22 @@ The three values are plain repository secrets (Settings, Secrets and variables, 
 To set or rotate one, pipe the value on stdin so it stays out of shell history and the process list:
 
 ```
-gh secret set VERCEL_TOKEN -R faizkhairi/interchange
+gh secret set VERCEL_TOKEN -R <owner>/<repo>
 ```
 
 After rotating the Vercel token in the Vercel account, run that command again with the new value, then revoke the old token. `VERCEL_ORG_ID` and `VERCEL_PROJECT_ID` are identifiers, not credentials, but they are stored as secrets too so one rule covers all three.
 
 ### The Health workflow (`.github/workflows/health.yml`)
 
-Name `Health`. It runs on the cron `17 * * * *` (minute 17 of every hour, UTC) and can be started by hand (`workflow_dispatch`) (`.github/workflows/health.yml:3-6`). The job has a 5 minute timeout, a sparse checkout of `scripts/ci` only, and `persist-credentials: false` (`.github/workflows/health.yml:14-21`). It runs `scripts/ci/health-check.sh` with 3 tries 30 seconds apart (`.github/workflows/health.yml:22-26`).
+Name `Health`. It runs on the cron `17 * * * *` (minute 17 of every hour, UTC) and can be started by hand (`workflow_dispatch`) (`.github/workflows/health.yml:3-6`). The job has a 5 minute timeout, a sparse checkout of `scripts/ci` only, and `persist-credentials: false` (`.github/workflows/health.yml:14-21`). It runs `scripts/ci/health-check.sh` with 3 tries 30 seconds apart (`.github/workflows/health.yml:22-29`).
 
-The check passes only on HTTP `200` with `status` equal to `ok` and `db` equal to `ok`. It fails on a non-200 answer, a `status` that is not `ok`, or a `db` that is not `ok`, and on failure prints only the HTTP code and those two fields, never the body (`scripts/ci/health-check.sh:19-34`). A failed run shows red in the Actions tab; GitHub's notification settings decide whether anyone is emailed. GitHub runs a schedule on a best-effort basis: it may start a run late or skip it. Measured here, 1 scheduled run started in the 17 hourly slots from 2026-11-16 18:17 to 2026-11-17 10:17 UTC. For a check that must run on time, point an external HTTP monitor at `GET /api/health` with a keyword match on `"db":"ok"` and email alerts (for example the free plan of Better Stack or UptimeRobot, after checking the provider's current terms); the workflow stays as a second signal.
+The check passes only on HTTP `200` with `status` equal to `ok` and `db` equal to `ok`. It fails on a non-200 answer, a `status` that is not `ok`, or a `db` that is not `ok`, and on failure prints only the HTTP code and those two fields, never the body (`scripts/ci/health-check.sh:19-34`). A failed run shows red in the Actions tab; GitHub's notification settings decide whether anyone is emailed. GitHub runs a schedule on a best-effort basis: it may start a run late or skip it. Measured here, 3 scheduled runs started in the 32 hourly slots from 2026-11-16 18:17 to 2026-11-18 01:17 UTC, so this workflow is a best-effort check, not an uptime monitor.
+
+By default the check calls the project's own production URL (the default in `scripts/ci/health-check.sh`). To point it at your deployment, set the repository variable `HEALTH_URL` (Settings, Secrets and variables, Actions, Variables) to the full URL of your `/api/health`; the workflow passes it as `HEALTH_URL: ${{ vars.HEALTH_URL }}`, and when the variable is unset the default applies, so nothing changes until you set it. Three ways to watch a deployment need no account beyond what you already have:
+
+1. **This workflow**, pointed at your deployment with `HEALTH_URL`, accepting that it runs late or skips slots.
+2. **Your own monitor**, whichever you already use, pointed at `GET /api/health` with a keyword match on `"db":"ok"` and its own alerting. It is the reliable option for a check that must run on time.
+3. **The in-app `tick_stale` alert.** When the tick is armed or cron-driven and has not run for 15 minutes, the alert fires, and alert delivery posts every transition to the one https webhook you choose ([alerting.md](alerting.md)). It needs no outside account, but it cannot report that the app or its database is down, because a dead app cannot post anything. That needs a probe from outside, which is option 1 or 2.
 
 ### Risks and limits
 
@@ -198,7 +296,8 @@ The check passes only on HTTP `200` with `status` equal to `ok` and `db` equal t
 | Migration gate on a push with no migration change | `PASS`, baseline read from the production deployment's `githubCommitSha` |
 | Migration gate failure on a migration push without the marker | Not run live (it needs a real migration push). A dry run of the gate script covered it with a local diff: exit 1 and `FAIL` before any deploy, and exit 0 with the `migration-applied` marker. The same dry run covered the fallbacks: meta missing, meta not in history, `event.before` unreachable or all zeros |
 | Health smoke after deploy | Passed on try 1 (HTTP 200, `status` ok, `db` ok) |
-| Health workflow | A manual run (`workflow_dispatch`) passed in 11 seconds. Over the next 17 hourly slots (2026-11-16 18:17 to 2026-11-17 10:17 UTC) only 1 scheduled run started (01:51 UTC, passed), so the schedule is best effort; an external monitor is the reliable option (see above) |
+| Health workflow | A manual run (`workflow_dispatch`) passed in 11 seconds. Over the 32 hourly slots from 2026-11-16 18:17 to 2026-11-18 01:17 UTC, 3 scheduled runs started (2026-11-17 at 01:51, 10:43 and 19:50 UTC, all passed), so the schedule is best effort and the workflow is not an uptime monitor |
+| Self-hosted stack from a clean checkout | Proven by CI job `selfhost` (`.github/workflows/ci.yml`) on every pull request and every push to `main`, with throwaway secrets. It builds the images, runs `setup` (migrate and seed) to exit 0, and brings up `db`, `app` and `cron` healthy on plain Postgres through the `pg` driver. It asserts `/api/health` answers 200 with `status` and `db` `ok`; `/login` answers 200 and one `/_next/static/` asset it references answers 200; the tick answers 200 with `ok: true` for the right secret, 401 for a wrong one and 503 with no header; at least 2 `tick` rows with trigger `cron` appear in `process_log` after 45 seconds (20 second interval); the real-Postgres integration test passes and the `rekey` dry run exits 0; and the app image holds no `.env*` file, holds `ssh2` and `pg`, and runs as a non-root user. `deploy` does not depend on it, so a registry outage cannot block a production deploy |
 
 ## Activating the dormant platform for a real project
 
@@ -209,7 +308,7 @@ A fresh deploy, fully migrated and seeded, is intentionally inert. Nothing above
 3. **Register the partner as an `external_system`.** It is created with `status = 'SETUP'` by default; it will not accept any inbound traffic yet, even if you go on to issue it credentials in the next step. This is deliberate: you can fully provision a partner (endpoint config, credentials) before exposing it to any traffic.
 4. **Issue credentials** from the system's detail page (click its code in the Systems list, then open the Credentials tab). For an inbound partner, issue an API key, a bearer token or Basic credentials (you choose the username, the server generates the password), optionally with a label and an expiry in days. For a system of a `partner+service` type, also choose Issue service key: the key and its key id are shown once, and without a usable key every call to that system is a 401. The secret is shown once; store it wherever the partner configures their outgoing calls. Use Rotate to replace one (an optional grace period of 0 to 1440 minutes lets the partner switch over; the default 0 revokes the old credential immediately) and Revoke to end one. For an outbound partner, configure its endpoint (`endpoint_config`: base URL, path template, method, timeout, retries) and store any credentials it needs to call out with Store credential on the same tab (`system_credential`, encrypted immediately via the vault). Revealing a stored outbound secret stays off unless `CREDENTIALS_REVEAL_ENABLED=1` and the user holds `credentials:reveal`. An outbound credential has a type: `api_key`, `oauth2` (a static bearer token), `oauth2_client` (OAuth 2.0 client credentials: the form takes the token URL, client id, client secret and an optional scope, audience and auth method, and the platform fetches and caches the token itself), `basic` (one secret in the form `user:password`) or `flag` (a secret on/off switch a connector reads). Except for a flag, it also has a list of allowed origins (1 to 10 exact origins, set at store or when rotating with a new secret): the credential is sent only on a request whose origin is both the endpoint's base URL origin and in that list, so enter the base URL origin there. An `oauth2_client` credential must have the list, and it must also contain the token URL's origin. To make an endpoint send a credential, set its Auth credential label (and, for an API key, the header, default `X-API-Key`) on the Endpoints tab. A label with no active credential dead-letters the job at attempt 1 as `CREDENTIAL_MISSING`; a stored credential that does not decrypt (usually a `CREDENTIAL_MASTER_KEY` that does not match) or cannot be a header value does so as `CREDENTIAL_INVALID`, and DLQ replay recovers the jobs once it is fixed.
 5. **Flip the system to `ACTIVE`.** Only after this does `authenticatePartner()` accept traffic for that system's `systemCode`. This is the single switch that turns a fully configured but dormant partner into a live one.
-6. **If you need recurring outbound work, arm the tick and a schedule.** Create a schedule with `schedules.create` (system, cron expression in UTC, payload; the handler is the system's integration type handler) and set `QSTASH_TOKEN`, `APP_URL`, `QSTASH_CURRENT_SIGNING_KEY` and `QSTASH_NEXT_SIGNING_KEY` in your environment. On the Schedules page, "Arm tick" registers the one QStash schedule (cadence `QSTASH_TICK_CRON`, default every 5 minutes) that calls `POST /api/jobs/tick`; arming an individual schedule only enables it and sets its `next_run_at`, it registers nothing with QStash. Nothing fires until the tick is armed. Each tick, in order: reclaims jobs stuck in `PROCESSING` (older than `JOB_STUCK_MINUTES`), fires the schedules whose `next_run_at` is due (claimed by compare-and-swap, so overlapping ticks fire a schedule once) and advances `next_run_at` from the cron expression, drains a bounded batch of `PENDING`/`RETRY` jobs, and prunes expired rate-limit buckets and old `activity_log` rows, then prunes old jobs, resolved alerts and old notifications, probes up to 5 due health URLs (`healthChecks`, P7b) and runs the throttled alert evaluation, which posts new alert transitions to the alert webhook when one is set (each stage is isolated; a failed stage makes the tick answer 500 so QStash retries). `/api/jobs/dispatch` (enqueue due schedules only) and `/api/jobs/process` (drain only) remain available as narrower endpoints. All three reject unsigned requests (401) and answer 503 while the signing keys are unset. Until `QSTASH_TOKEN` is set, `armTick()` in `core/jobs/qstash.ts` is a documented no-op, so nothing fires on a timer by accident. Check your QStash plan's message quota before lowering `QSTASH_TICK_CRON`; the quota is spent per tick, not per schedule, and a 5-minute cadence is a safe default.
+6. **If you need recurring outbound work, arm the tick and a schedule.** Create a schedule with `schedules.create` (system, cron expression in UTC, payload; the handler is the system's integration type handler) and set `QSTASH_TOKEN`, `APP_URL`, `QSTASH_CURRENT_SIGNING_KEY` and `QSTASH_NEXT_SIGNING_KEY` in your environment. On the Schedules page, "Arm tick" registers the one QStash schedule (cadence `QSTASH_TICK_CRON`, default every 5 minutes) that calls `POST /api/jobs/tick`; arming an individual schedule only enables it and sets its `next_run_at`, it registers nothing with QStash. Nothing fires until the tick is armed. Each tick, in order: reclaims jobs stuck in `PROCESSING` (older than `JOB_STUCK_MINUTES`), fires the schedules whose `next_run_at` is due (claimed by compare-and-swap, so overlapping ticks fire a schedule once) and advances `next_run_at` from the cron expression, drains a bounded batch of `PENDING`/`RETRY` jobs, and prunes expired rate-limit buckets and old `activity_log` rows, then prunes old jobs, resolved alerts and old notifications, probes up to 5 due health URLs (`healthChecks`, P7b) and runs the throttled alert evaluation, which posts new alert transitions to the alert webhook when one is set (each stage is isolated; a failed stage makes the tick answer 500 so QStash retries). `/api/jobs/dispatch` (enqueue due schedules only) and `/api/jobs/process` (drain only) remain available as narrower endpoints. All three accept a valid QStash signature or, when `CRON_SECRET` is set, the matching `Authorization: Bearer` value (the self-hosted path, see "Self-hosting"). Otherwise they reject the request (401) and answer 503 while the QStash signing keys are unset. Until `QSTASH_TOKEN` is set, `armTick()` in `core/jobs/qstash.ts` is a documented no-op, so nothing fires on a timer by accident. Check your QStash plan's message quota before lowering `QSTASH_TICK_CRON`; the quota is spent per tick, not per schedule, and a 5-minute cadence is a safe default.
 7. **Verify with the health endpoint.** `GET /api/health` returns the service name, `status`, the connector count, a database reachability check (`db`) and a timestamp, useful as a first smoke test after each of the steps above, and as an ongoing liveness probe for uptime monitoring afterward.
 
 None of steps 2 to 6 require a redeploy. They are all admin-console or QStash-dashboard actions against the already-deployed platform.

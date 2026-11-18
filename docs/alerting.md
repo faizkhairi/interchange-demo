@@ -15,7 +15,7 @@ One pure module, `core/pure/alert-rules.ts`, holds the rules, thresholds and mes
 | `inbound_error_rate` | system | 5xx share of inbound calls in the last 15 minutes, at least 20 calls | 20% | 50% |
 | `cert_expiry` | certificate | a non-revoked certificate of a non-deleted system ends within 30 days, or has ended | within 30 days | within 7 days, or expired |
 | `system_down` | system | an `ACTIVE`, non-deleted system whose stored health is `DOWN` | always | never |
-| `tick_stale` | platform | the tick is armed and has not run for 15 minutes (or has not run since it was armed) | always | never |
+| `tick_stale` | platform | the tick is armed (a QStash schedule) or cron-driven (`CRON_SECRET` set and cron ticks recorded) and has not run for 15 minutes (or has not run since it was armed) | always | never |
 | `job_stuck` | job | a live `PROCESSING` job locked longer than `JOB_STUCK_MINUTES` (default 10) | always | never |
 | `queue_backlog` (P7b) | platform | live jobs are due and the oldest has waited 15 minutes or more | oldest due job waited 15 minutes | oldest due job waited 60 minutes, or 500 or more due jobs |
 
@@ -44,14 +44,14 @@ What starts an evaluation depends on whether the scheduler is dormant or armed.
 
 | State | What runs the evaluation | Window |
 |---|---|---|
-| **Dormant** (the QStash tick is not armed; the production default) | The throttled after-response run. It is started after the response of `notifications.list`, `alerts.list` and `systemHealth.get` (`core/http/admin-handlers.ts:269-275`), and after an inbound call finishes (`src/app/api/inbound/[systemCode]/[endpoint]/route.ts:242`) | At most once per 300 seconds across instances (`core/pure/alert-rules.ts:49`, `core/jobs/alerts.ts:516-553`) |
-| **Armed** (QStash configured and the tick armed) | The tick stage `alerts`, which runs after the stage `healthChecks` (`src/app/api/jobs/tick/route.ts:75-76`). The after-response run still happens as well | 240 seconds for the tick, so a tick that lands a few seconds early does not skip (`core/jobs/alerts.ts:50-52`) |
+| **Dormant** (no tick: no QStash schedule armed and no cron tick recorded; the default) | The throttled after-response run. It is started after the response of `notifications.list`, `alerts.list` and `systemHealth.get` (`core/http/admin-handlers.ts:269-275`), and after an inbound call finishes (`src/app/api/inbound/[systemCode]/[endpoint]/route.ts:242`) | At most once per 300 seconds across instances (`core/pure/alert-rules.ts:49`, `core/jobs/alerts.ts:516-553`) |
+| **Armed** (QStash configured and the tick armed, or a cron-driven tick through `CRON_SECRET`) | The tick stage `alerts`, which runs after the stage `healthChecks` (`src/app/api/jobs/tick/route.ts:75-76`). The after-response run still happens as well | 240 seconds for the tick, so a tick that lands a few seconds early does not skip (`core/jobs/alerts.ts:50-52`) |
 | **Either** | The admin action "Evaluate now" (`alerts.evaluate`, `settings:write`). It ignores the window, still takes the advisory lock and stamps the window (`core/jobs/alerts.ts:555-573`) | None |
 
 Consequences with the tick dormant:
 
 - Alerts are only as fresh as the traffic that triggers them. With no console use and no inbound calls, nothing evaluates.
-- `tick_stale` stays quiet while the tick is not armed (`core/pure/alert-rules.ts:365`).
+- `tick_stale` stays quiet while the tick is not armed (`core/pure/alert-rules.ts:365`). A cron-driven tick counts as armed once a cron tick has been recorded, so the rule covers both modes and fires after 15 minutes without a tick; run the scheduler every 5 minutes or less.
 - `system_down` needs a health result. The scheduled health check (below) is what produces one without a human click.
 
 The after-response triggers sit behind `alertTriggerEnabled()`, a module flag that is on in production and off under test (`core/jobs/alert-trigger.ts:13-21`). Every run is recorded as an `alerts` row in `process_log`. The summary of that row carries the transition counts and, since P7b, `delivered`, `deliveryFailed` and `deliveryThrottled` (`core/jobs/alerts.ts:495-509`).

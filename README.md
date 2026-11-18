@@ -36,9 +36,9 @@ flowchart LR
   API --> H["HTTP backend"]
   API --> D["In-browser demo engine"]
   H --> C
-  C --- DB[("Neon Postgres")]
-  Q["QStash tick<br/>dormant"] -.-> C
-  subgraph V["Vercel functions, region sin1, next to the database"]
+  C --- DB[("Postgres")]
+  Q["Job tick: cron or QStash<br/>dormant"] -.-> C
+  subgraph V["App server, for example Vercel functions in region sin1"]
     G
     C
     H
@@ -49,8 +49,9 @@ flowchart LR
 - The gateway order is fixed: rate limit by IP, authenticate the caller, confirm the URL's system code matches the caller, apply per-system limits, validate against the connector's schema, run, log.
 - Inbound work runs inline, or is accepted with `202` when a partner sends `Prefer: respond-async` with an `Idempotency-Key` to a connector that opted in.
 - Outbound and scheduled work drains from a Postgres queue. There is no Redis and no long-running worker.
-- A signed QStash tick fires cron schedules exactly once. It stays dormant until an operator arms it.
-- Vercel functions run in region `sin1`, next to the Neon database, to keep each query's round trip short.
+- A job tick fires cron schedules exactly once. QStash (signed) or any cron that holds a shared secret can call it, and it stays dormant until an operator arms it or points a scheduler at it.
+- Requirements: PostgreSQL and a Node 22 host, or Docker Compose for the whole stack ([self-hosting](docs/deployment.md#self-hosting)). Vercel, Neon and QStash are optional.
+- The hosted demo runs on Vercel in region `sin1`, next to its Neon database, to keep each query's round trip short.
 
 More in [docs/architecture.md](docs/architecture.md).
 
@@ -122,7 +123,7 @@ Each flow has its steps in [docs/walkthrough.md](docs/walkthrough.md).
 
 Feature complete for a single team. Production runs dormant, with no partner systems connected. CI deploys `main` to production behind a migration gate, and an hourly workflow checks the deployment's health (GitHub runs it on a best-effort schedule, see [Deployment](docs/deployment.md)).
 
-Stack: Next.js (App Router), Drizzle ORM, Neon serverless Postgres, TypeScript and zod, deployed on Vercel.
+Stack: Next.js (App Router), Drizzle ORM, PostgreSQL (Neon serverless or node-postgres), TypeScript and zod. The hosted demo is deployed on Vercel; you can also self-host with Docker Compose.
 
 ## Note
 
