@@ -155,7 +155,7 @@ The tick endpoints accept a QStash signature or the `CRON_SECRET` bearer, and no
 
 - **Backups are yours.** The stack does not back up the database. Dump it on a schedule, for example `docker compose exec -T db pg_dump -U interchange interchange > backup.sql`, and keep `CREDENTIAL_MASTER_KEY` with the backup.
 - **No TLS.** Terminate it at the reverse proxy.
-- **Build needs network.** The image build downloads Google Fonts through `next/font/google`, so it cannot run offline.
+- **Build needs no font download.** Space Grotesk and IBM Plex Sans (SIL Open Font License 1.1) come from the `@fontsource-variable` packages that `npm ci` installs, so `next build` makes no request to a font host.
 - **Tested on Postgres 17.** Older majors are not tested.
 - **Without Docker.** Any Node 22 host works: `npm ci`, then `npx tsx db/migrate.ts` and `npx tsx db/seed.ts` with the variables in the environment (`npm run db:migrate` and `npm run db:seed` read them from `.env.local` instead), then `npm run build` and `npm start`, plus an operating-system cron entry for the tick.
 
