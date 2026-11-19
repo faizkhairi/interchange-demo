@@ -1,6 +1,6 @@
 # Security
 
-Last updated: 2026-11-17
+Last updated: 2026-11-19
 
 This document describes Interchange's security posture: how credentials are protected at rest, how inbound partner requests are authenticated and confined, how outbound requests are kept away from internal networks, how admin access is controlled, why the dormant-by-default posture is itself a security property, and what an attacker can and cannot do if a partner credential is compromised.
 
@@ -490,7 +490,7 @@ The provisioned-dormant default is described in `docs/architecture.md` as a cost
 
 ## Dependency audit
 
-`npm audit` runs before each release. The state after P7d (Next.js 16.4.5, zod 4.6.7, next-auth 4.24.15, undici 7.30.1, postcss 8.5.23, tsx 4.23.15, vitest 4.1.12, all pinned exactly): `npm audit --omit=dev` reads 0, and the GitHub Actions SHA pins are kept fresh by a monthly grouped Dependabot PR.
+`npm audit` runs before each release. The state after P7d (Next.js 16.4.5, zod 4.6.7, next-auth 4.24.15, undici 7.30.1, postcss 8.5.23, tsx 4.23.15, vitest 4.1.12, all pinned exactly): `npm audit --omit=dev` reads 0, and the GitHub Actions SHA pins and the pinned Node and Postgres images (within their major) are kept fresh by monthly grouped Dependabot PRs.
 
 - **Fixed, production:** Next.js 16.4.5 (GHSA-mfr8-8qww-v76h; the app is not exposed, since it uses no `use cache` or `unstable_cache`) and zod 4.6.7 (GHSA-mrhx-c7xc-m3w5: array, set and map bounds are now checked before the elements, so an oversized failing array gives one issue instead of one per element). Every input zod parses is also bounded first: the admin API reads at most 64 KB of body and the inbound gateway at most 1 MiB (see "Inbound body size"). `zod-to-json-schema` was removed: both generators use zod's own `z.toJSONSchema`.
 - **Accepted, development only:** the typescript-eslint chain via minimatch (GHSA-g3hv-75wg-m249; the fix needs typescript-eslint 8.73.0, released 2026-11-16, which is held under a 7-day supply-chain cooldown and goes in as a lockfile-only update from 2026-11-23) and the drizzle-kit chain via @esbuild-kit and esbuild (GHSA-67mh-4wv8-2f99; there is no non-breaking fix, and the 0.18.1 that npm suggests is a downgrade). None of them ships in the build; they run only on a developer machine or in CI.

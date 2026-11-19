@@ -1,6 +1,6 @@
 # Deployment
 
-Last updated: 2026-11-18
+Last updated: 2026-11-19
 
 This document covers deploying Interchange: what you need to run it, the environment variables, self-hosting with Docker Compose, the optional Neon and Vercel deployment, running migrations and the seed, the automated deploy job and the best-effort health workflow in GitHub Actions, and the steps to activate the platform for a real project once it is deployed.
 
@@ -226,22 +226,22 @@ P7b adds a production deploy job to the CI workflow and an hourly Health workflo
 
 ### The deploy job (`.github/workflows/ci.yml`)
 
-The `deploy` job runs only on a push to `main`, and only after the `verify` job passes (`needs: verify`, `.github/workflows/ci.yml:56-58`). A pull request never deploys. Its steps, in order:
+The `deploy` job runs only on a push to `main`, and only after the `verify` job passes (`needs: verify`, `.github/workflows/ci.yml:170-172`). A pull request never deploys. Its steps, in order:
 
-1. **Check out** with the full history (`fetch-depth: 0`, needed by the migration gate) and `persist-credentials: false`, so the job token is not left in the git config (`.github/workflows/ci.yml:74-77`).
-2. **Check secrets.** The three repository secrets `VERCEL_TOKEN`, `VERCEL_ORG_ID` and `VERCEL_PROJECT_ID` must be non-empty. If any is missing the job fails at once with an error that names it, before anything else runs (`.github/workflows/ci.yml:78-87`).
+1. **Check out** with the full history (`fetch-depth: 0`, needed by the migration gate) and `persist-credentials: false`, so the job token is not left in the git config (`.github/workflows/ci.yml:188-191`).
+2. **Check secrets.** The three repository secrets `VERCEL_TOKEN`, `VERCEL_ORG_ID` and `VERCEL_PROJECT_ID` must be non-empty. If any is missing the job fails at once with an error that names it, before anything else runs (`.github/workflows/ci.yml:192-201`).
 3. **Migration gate** (`scripts/ci/migration-gate.sh`, below).
-4. **Deploy to production**: `npx --yes vercel@50.22.1 deploy --prod --yes --token="$VERCEL_TOKEN" --meta githubCommitSha="$GITHUB_SHA"` (`.github/workflows/ci.yml:92-103`). The Vercel CLI version is pinned. The token is passed with `--token` because this CLI does not read `VERCEL_TOKEN` from the environment (the first deploy run failed with "No existing credentials found" without it); the org and project ids are read from the environment. GitHub Actions masks the secret in the log, and the runner is discarded after the job. The commit is recorded on the deployment as `githubCommitSha`, which is what the next run's migration gate reads. The deployment URL and the commit go into the job summary.
-5. **Health smoke** (`scripts/ci/health-check.sh`): `GET /api/health` must answer `200` with `status` and `db` both `ok`, tried 3 times 20 seconds apart (`scripts/ci/health-check.sh:1-34`, `.github/workflows/ci.yml:104-105`).
+4. **Deploy to production**: `npx --yes vercel@50.22.1 deploy --prod --yes --token="$VERCEL_TOKEN" --meta githubCommitSha="$GITHUB_SHA"` (`.github/workflows/ci.yml:206-217`). The Vercel CLI version is pinned. The token is passed with `--token` because this CLI does not read `VERCEL_TOKEN` from the environment (the first deploy run failed with "No existing credentials found" without it); the org and project ids are read from the environment. GitHub Actions masks the secret in the log, and the runner is discarded after the job. The commit is recorded on the deployment as `githubCommitSha`, which is what the next run's migration gate reads. The deployment URL and the commit go into the job summary.
+5. **Health smoke** (`scripts/ci/health-check.sh`): `GET /api/health` must answer `200` with `status` and `db` both `ok`, tried 3 times 20 seconds apart (`scripts/ci/health-check.sh:1-34`, `.github/workflows/ci.yml:218-219`).
 
 Settings that matter:
 
 | Setting | Value | Why |
 |---|---|---|
-| Permissions | `contents: read` | The job needs nothing else from GitHub (`.github/workflows/ci.yml:61-62`) |
-| Environment variables | `VERCEL_TOKEN`, `VERCEL_ORG_ID`, `VERCEL_PROJECT_ID`, from repository secrets | `.github/workflows/ci.yml:69-72` |
-| Timeout | 15 minutes | `.github/workflows/ci.yml:60` |
-| Concurrency | group `deploy-production`, `cancel-in-progress: false` | A running deploy is never cancelled (`.github/workflows/ci.yml:63-68`) |
+| Permissions | `contents: read` | The job needs nothing else from GitHub (`.github/workflows/ci.yml:175-176`) |
+| Environment variables | `VERCEL_TOKEN`, `VERCEL_ORG_ID`, `VERCEL_PROJECT_ID`, from repository secrets | `.github/workflows/ci.yml:183-186` |
+| Timeout | 15 minutes | `.github/workflows/ci.yml:174` |
+| Concurrency | group `deploy-production`, `cancel-in-progress: false` | A running deploy is never cancelled (`.github/workflows/ci.yml:177-182`) |
 
 **Two pushes close together.** The job's concurrency group keeps one run going and at most one waiting. When a third arrives, GitHub replaces the older waiting run with the newer one, so a middle push may never deploy, but the last push always does. The workflow-level group `ci-<ref>` behaves the same for whole runs on `main` (`cancel-in-progress` is on only for pull requests, `.github/workflows/ci.yml:11-14`). A skipped middle push cannot hide a migration, because the migration gate compares against what production serves, not against the previous push.
 
@@ -283,7 +283,7 @@ By default the check calls the project's own production URL (the default in `scr
 
 - **Actions minutes.** The hourly Health run costs about 720 minutes a month (24 runs a day, billed at least one minute each). The Free plan includes 2,000 minutes a month for private repositories. The `verify` job also costs 16 to 25 minutes per push to `main` and per pull request run, plus the deploy job. Heavy pushing plus the hourly check can reach the limit. A 2-hourly cron (`17 */2 * * *`) halves the Health cost. Check Settings, Billing, Actions usage before raising the cadence.
 - **Secrets are repository secrets**, not an Environment (see above).
-- **Actions are pinned to full commit SHAs**, with the release tag in a comment (`actions/checkout` v7.0.1, `actions/setup-node` v7.1.0), because a tag can move. To update one, resolve the new release tag to its commit and replace the SHA and the comment together. Dependabot (`.github/dependabot.yml`) opens one grouped pull request a month with the new SHAs, so the update check costs about one `verify` run a month.
+- **Actions are pinned to full commit SHAs**, with the release tag in a comment (`actions/checkout` v7.0.1, `actions/setup-node` v7.1.0), because a tag can move. To update one, resolve the new release tag to its commit and replace the SHA and the comment together. Dependabot (`.github/dependabot.yml`) checks three things monthly: the Actions SHAs, the Dockerfile Node image and the compose Postgres image. Each opens at most one grouped pull request, so the update check costs about three CI runs a month (more if a pull request is rebased). The two images take minor and patch updates only, and a major upgrade is done by hand: a Node major changes CI, the Dockerfile and these docs together; a Postgres major changes `compose.yaml`, the data volume (the 18 image moves the data directory, and existing data needs `pg_upgrade`) and these docs.
 - **No automatic rollback.** A failed Health smoke leaves the new deployment live. Roll back by promoting the previous deployment (the rollback section of the operations runbook, in the source repository); a migration is not reversed by a rollback.
 - **The deploy job builds on Vercel**, so a build that passes in CI can still fail there; the job fails in that case and production keeps the previous deployment.
 - **Manual deploys still work.** The job is a convenience, not a lock. A deploy made by hand with the Vercel CLI carries no `githubCommitSha` unless the command sets it, and the gate then falls back to `github.event.before` as its baseline (`scripts/ci/migration-gate.sh:59-68`).
